@@ -30,7 +30,7 @@ public final class OutboxCrashWriterProcess {
                         "VALUES ('crash-tenant', 'CRASH-EMP-1', 'Crash Test Employee', 'crash@example.com', 'M-1', 'BLR', '+919876543210', 1, TRUE, FALSE, now())")) {
                     employee.executeUpdate();
                 }
-                String payload = "{\\"eventId\\":\\"" + eventId + "\\",\\"tenantId\\":\\"crash-tenant\\",\\"employeeId\\":\\"CRASH-EMP-1\\"}";
+                String payload = "{\"eventId\":\"" + eventId + "\",\"tenantId\":\"crash-tenant\",\"employeeId\":\"CRASH-EMP-1\"}";
                 try (PreparedStatement outbox = connection.prepareStatement(
                         "INSERT INTO outbox_events (id, tenant_id, employee_id, event_type, payload, created_at, attempts) " +
                         "VALUES (?, 'crash-tenant', 'CRASH-EMP-1', 'EMPLOYEE_CREATED', ?, now(), 0)")) {
