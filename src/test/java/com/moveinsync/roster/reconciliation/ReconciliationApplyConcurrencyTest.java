@@ -161,7 +161,7 @@ class ReconciliationApplyConcurrencyTest {
         // 2. Reconciliation run created in AWAITING_APPROVAL (brake tripped)
         jdbc.update("INSERT INTO reconciliation_runs(id, tenant_id, status, active_before, snapshot_rows, estimated_missing, missing_ratio, safety_brake, created_at) " +
                     "VALUES (?, ?, 'AWAITING_APPROVAL', 2, 1, 1, 0.50, true, now())", runId, tenant);
-        jdbc.update("INSERT INTO reconciliation_missing(run_id, tenant_id, employee_id) VALUES (?, ?, ?)", runId, tenant, "E-300", 1L);
+        jdbc.update("INSERT INTO reconciliation_missing(run_id, tenant_id, employee_id, expected_source_version) VALUES (?, ?, ?, ?)", runId, tenant, "E-300", 1L);
 
         // 3. Confirm an unapproved run can NEVER be applied directly
         IllegalStateException unapprovedEx = assertThrows(IllegalStateException.class, () -> service.apply(tenant, runId));
