@@ -197,7 +197,7 @@ Run the automated tests:
 mvn clean test
 ```
 
-The normal test suite includes **61 automated tests** across 13 test classes covering stale/duplicate event handling, out-of-order versions, transport field preservation, deactivation semantics, RFC-4180 streaming CSV parsing across buffer boundaries, safe record-level handling of malformed rows, safety-brake threshold enforcement, concurrent apply and approval row-locking, outbox publishing with `SKIP LOCKED`, and end-to-end reconciliation diffing. The latest local run completed with 61 tests passing, 0 failures, 0 errors, and 0 skipped. The application was also started with Docker Compose, and its health endpoint returned `UP`.
+The normal test suite includes **62 automated tests** across 14 test classes covering stale/duplicate event handling, out-of-order versions, transport field preservation, deactivation semantics, RFC-4180 streaming CSV parsing across buffer boundaries, safe record-level handling of malformed rows, safety-brake threshold enforcement, concurrent apply and approval row-locking, outbox publishing with `SKIP LOCKED`, real process-crash recovery between database commit and Kafka publication, and end-to-end reconciliation diffing. The latest local `mvn clean test` run completed with 62 tests passing, 0 failures, 0 errors, and 0 skipped in 2 minutes 2 seconds. The dedicated process-crash recovery test also passed independently (1 test, 0 failures, 0 errors, 0 skipped). The application was also started with Docker Compose, and its health endpoint returned `UP`.
 
 ### Automated Test Suite Overview
 
@@ -213,6 +213,7 @@ The normal test suite includes **61 automated tests** across 13 test classes cov
 | `ReconciliationServiceTest` | 2 | Reconciliation service unit flow and status checks | Unit / Mockito |
 | `DeactivationBookingListenerTest` | 2 | Kafka deactivation listener, duplicate delivery safety | Unit / Mockito |
 | `OutboxRecoveryTest` | 2 | Polling outbox recovery and retry after Kafka failure | Unit / Mockito |
+| `OutboxProcessCrashRecoveryTest` | 1 | Kill a real child JVM after PostgreSQL commit, then publish the persisted outbox event to embedded Kafka after restart | Testcontainers PostgreSQL + Embedded Kafka |
 | `OutboxSkipLockedConcurrencyTest` | 1 | Multi-instance outbox polling with `SKIP LOCKED` | Testcontainers PostgreSQL |
 | `Reconciliation200kBenchmarkTest` | 1 | Mocked repo streaming disk CSV diff (200k rows) | Benchmark |
 | `ReconciliationPostgresIntegrationBenchmarkTest` | 1 | Real PostgreSQL 16 streaming diff & staging writes (5k DB + 5k CSV) | Testcontainers PostgreSQL |
@@ -231,7 +232,7 @@ The 200,000-row database-backed preview completed under the case-study target of
 - **CSV memory use:** Disk buckets reduce the amount of data held in memory at one time. Expected memory use is lower when records are spread across buckets; an unusually uneven distribution can make one bucket large.
 - **Authentication:** Demo users are stored in memory and use HTTP Basic authentication. Production needs enterprise login and stronger access management.
 - **Outbox history:** Published event records are retained. A production system should add an archive or cleanup process.
-- **Failure testing:** The project tests retry and recovery behavior, but a full process-crash test between the database commit and Kafka publication would provide stronger evidence for the case-study failure requirement.
+- **Failure testing:** `OutboxProcessCrashRecoveryTest` starts a separate JVM that commits an employee and outbox row, forcibly terminates that process before publication, then verifies that a fresh publisher can deliver the persisted event to Kafka and mark it published. This validates recovery from the tested crash window; it does not simulate every possible broker, network, or host failure.
 
 ## Repository
 
