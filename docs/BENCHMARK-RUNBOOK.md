@@ -19,7 +19,25 @@ Run from the repository root:
     "=== Docker ==="
     docker version --format '{{.Server.Version}}'
 
-Save the output with the assessment evidence.
+### Captured assessment-machine configuration (2026-10-30)
+
+The following values were supplied from the assessment machine:
+
+| Item | Captured value |
+|---|---|
+| Operating system | Windows 11 Home Single Language, build 10.0.26300, 64-bit |
+| Installed RAM | 8,451,309,568 bytes (approximately 7.87 GiB) |
+| Java | Eclipse Temurin OpenJDK 21.0.13+9 LTS, 64-bit Server VM |
+| Maven | Apache Maven 3.10.0 |
+| Docker Desktop | 4.97.0 |
+| Docker Engine | 29.9.2, Linux/amd64 (desktop-linux context) |
+| CPU model / core count | Not captured in the supplied output; still required |
+
+The CPU query did not return a visible value in the supplied output. Run this separately and append the result:
+
+    Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors
+
+Save the output with the assessment evidence. These machine details were collected after the previously recorded 200k benchmark, so they are not proof that the benchmark was run on this exact configuration unless confirmed by a fresh run.
 
 ## 2. Repeated 200,000-row database benchmark
 
