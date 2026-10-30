@@ -1,176 +1,202 @@
-# Design Note — HR Roster Sync
+# Design Note – HR Roster Sync
 
-## Architecture
+## 1. What problem does this project solve?
 
-```mermaid
-flowchart LR
-  HR[HR API / Nightly CSV] --> API[Spring Boot API]
-  API --> V[Boundary validation]
-  V --> S[EmployeeSyncService]
-  S --> DB[(PostgreSQL employees)]
-  S --> OB[(Transactional outbox)]
-  OB --> PUB[Outbox publisher: FOR UPDATE SKIP LOCKED]
-  PUB --> K[(Kafka employee-changes)]
-  K --> BOOK[Booking cancellation consumer]
-  BOOK --> CAB[(Cab bookings / seat reservation)]
-  TA[Transport Admin] --> TP[Transport profile API]
-  TP --> DB
-  CSV[Nightly snapshot CSV] --> PARSE[RFC-4180 streaming CSV parser]
-  PARSE --> REC[256-bucket streaming partitioner]
-  REC --> DIFF[Bucket-by-bucket 3-way diff]
-  DIFF --> STAGE[(Staging: reconciliation_new, reconciliation_changed, reconciliation_missing)]
-  DIFF --> BRAKE{Missing threshold >= 30%?}
-  BRAKE -->|Yes| HOLD[Awaiting operator approval]
-  BRAKE -->|No| PLAN[Ready to apply]
-  HOLD --> APPROVE[Operator approval: /{runId}/approve]
-  APPROVE --> APPLY[Concurrency-safe apply: /{runId}/apply]
-  PLAN --> APPLY
-  APPLY --> DB
-  APPLY --> OB
-```
+MoveInSync receives employee information from corporate clients. The information may arrive more than once, arrive in the wrong order, contain invalid values, or arrive as an incomplete nightly file.
 
-## Hardest flow: ordering and atomic outbox
+This project keeps the employee records correct in those situations. It also makes sure that HR updates do not overwrite information managed by the transport team.
 
-```mermaid
-sequenceDiagram
-  participant HR as HR source
-  participant API as API/service
-  participant DB as PostgreSQL
-  participant P as Outbox publisher
-  participant K as Kafka
-  HR->>API: event (tenant, employee, version)
-  API->>DB: advisory transaction lock by tenant + employee
-  API->>DB: lock employee row if it exists
-  DB-->>API: current version
-  alt incoming version <= current version
-    API-->>HR: ignored (duplicate/stale)
-  else incoming version is newer
-    API->>DB: update HR-owned fields only
-    API->>DB: insert outbox event with UUID
-    API->>DB: commit employee + outbox atomically
-    API-->>HR: applied
-    P->>DB: poll unpublished outbox (FOR UPDATE SKIP LOCKED)
-    P->>K: publish (key tenant:employee)
-    P->>DB: mark published
-  end
-```
+The design follows the main requirements in **Case Study 5: HR Roster Sync – Idempotent, Out-of-Order, Self-Healing**.
 
-## Three-Way Reconciliation Architecture
+## 2. Main parts of the system
 
-The nightly reconciliation compares an incoming HR snapshot against the existing database to compute a complete three-way diff:
-
-### 1. The Three Diff Categories
-
-1. **New Employees (`reconciliation_new`)**:
-   - Present in incoming HR snapshot, absent in database.
-   - At apply time: inserted as new records with `active = true`, `source_version = 1`, and outbox event `EMPLOYEE_CHANGED (SNAPSHOT_CREATED)`.
-2. **Changed Employees (`reconciliation_changed`)**:
-   - Present in both snapshot and database.
-   - One or more HR-owned fields differ: `name`, `email`, `manager_id`, `office_code`, or previously inactive.
-   - Transport-owned fields (`pickup_point`, `special_assistance`) are completely ignored during comparison.
-   - At apply time: updated with new HR fields, version incremented (`source_version = source_version + 1`), transport fields preserved intact, and outbox event `EMPLOYEE_CHANGED (SNAPSHOT_UPDATED)`.
-3. **Missing Active Employees (`reconciliation_missing`)**:
-   - Present as active in database, absent in snapshot.
-   - Subject to the 30% safety brake calculation.
-   - At apply time: deactivated (`active = false`), version incremented (`source_version = source_version + 1`), and outbox event `EMPLOYEE_DEACTIVATED (SNAPSHOT_DEACTIVATED)`.
-
-### 2. Streaming RFC-4180 CSV Parsing & Bounded-Memory Algorithm (256 Disk Buckets)
-
-Loading 200,000 employee records into memory causes excessive heap pressure and risk of `OutOfMemoryError`. To maintain bounded working memory:
+- **HR system:** Sends employee changes through an API or provides a nightly CSV file.
+- **Spring Boot application:** Checks incoming data and applies valid changes.
+- **PostgreSQL:** Stores employee records, file-comparison results and outgoing event records.
+- **Redis:** Keeps a short-lived copy of employee profiles to make reads faster.
+- **Kafka:** Carries employee-change events to other services.
+- **Booking listener:** Responds to deactivation events by cancelling future confirmed cab bookings and freeing the reserved seat.
+- **Transport API:** Lets transport admins update pickup point and special-assistance details.
 
 ```mermaid
 flowchart TD
-  subgraph Phase 1: Streaming RFC-4180 CSV Parsing
-    CSV[Incoming CSV Stream] --> PARSER[CsvStreamParser: quoted commas, escaped quotes, reordered headers]
-    PARSER --> P1[Hash employeeId % 256]
-    P1 --> S0[snapshot-0.txt]
-    P1 --> S1[snapshot-1.txt]
-    P1 --> S255[snapshot-255.txt]
-  end
-  subgraph Phase 2: Database Cursor Streaming
-    DB[(PostgreSQL Stream fetchSize=1000)] --> P2[Hash employeeId % 256]
-    P2 --> D0[db-0.txt]
-    P2 --> D1[db-1.txt]
-    P2 --> D255[db-255.txt]
-  end
-  subgraph Phase 3: Paired Bucket Diff
-    S0 & D0 --> DIFF0[In-Memory Join Bucket 0]
-    S1 & D1 --> DIFF1[In-Memory Join Bucket 1]
-    S255 & D255 --> DIFF255[In-Memory Join Bucket 255]
-    DIFF0 & DIFF1 & DIFF255 --> STAGING[(Persist Staging Tables)]
+  HR[HR system] -->|Employee events| API[Spring Boot API]
+  HR -->|Nightly CSV| CSV[CSV file reader]
+  API --> DB[(PostgreSQL)]
+  CSV --> DIFF[Compare file with employee records]
+  DIFF --> REVIEW[Preview and safety check]
+  REVIEW -->|After approval if needed| DB
+  API --> OUTBOX[Outgoing event records]
+  DB --> OUTBOX
+  OUTBOX --> KAFKA[Kafka]
+  KAFKA --> LISTENER[Booking listener]
+  LISTENER --> BOOKINGS[Future cab bookings]
+  TRANSPORT[Transport admin] --> TAPI[Transport profile API]
+  TAPI --> DB
+  API <--> CACHE[Redis profile cache]
+```
+
+## 3. Handling duplicate and out-of-order updates
+
+Every employee update has a version supplied by the source system. The application compares the incoming version with the version already stored for that employee.
+
+For example, if version 7 has already been saved:
+
+| Incoming version | What the application does |
+|---|---|
+| 7 | Ignores it because it is a duplicate |
+| 6 | Ignores it because it is older |
+| 8 | Applies it because it is newer |
+
+The application uses the tenant ID, employee ID and source version to identify repeated updates. Database locks protect updates for the same employee when requests arrive at the same time, including when the employee is being created for the first time.
+
+This directly addresses the case-study example where version 7 arrives before version 6: version 6 must not undo the newer information.
+
+## 4. Keeping HR and transport information separate
+
+The case study says that HR owns the employee's name, email, manager and office, while transport admins own pickup point and special-assistance needs.
+
+This project follows that split:
+
+| HR can change | Transport admin can change |
+|---|---|
+| Name | Pickup point |
+| Email | Special-assistance needs |
+| Manager | |
+| Office | |
+| Phone and active status | |
+
+An HR update changes only HR-owned fields. The transport fields stay as they were. This prevents an HR file from accidentally removing transport preferences.
+
+## 5. Nightly file comparison
+
+The nightly CSV is compared with the employee records already stored in PostgreSQL. The comparison creates three groups:
+
+| Group | Meaning | Result when applied |
+|---|---|---|
+| New | In the file, not in the database | Create an employee |
+| Changed | In both places, but an HR-owned field changed | Update the HR-owned fields |
+| Missing | Active in the database, not in the file | Mark the employee inactive |
+
+The application first creates a **preview**. The preview saves the proposed changes in staging tables but does not change live employee records.
+
+### How large files are processed
+
+The case study asks for a comparison of up to 200,000 employees without loading the entire CSV and database list into memory.
+
+This project processes the data in smaller pieces:
+
+1. Read the CSV gradually, handling quoted values, commas inside quotes, escaped quotes and line breaks inside quoted values.
+2. Put each CSV record into one of 256 temporary disk files based on its employee ID.
+3. Read employee records from PostgreSQL gradually and put them into matching temporary files.
+4. Compare one matching pair of files at a time.
+5. Save the new, changed and missing records in the database staging tables.
+6. Remove the temporary files after processing.
+
+This reduces the amount of data that normally needs to be in memory at once.
+
+**Memory trade-off:** When employee IDs are spread reasonably evenly across the 256 groups, each comparison handles only a portion of the data. If many IDs end up in one group, that group can become large. Therefore, the design reduces expected memory use but does not guarantee a fixed maximum for every possible input.
+
+## 6. Safety brake: protect against an incomplete file
+
+A nightly export may be cut short. If the application treated every missing employee as someone who had left, it could deactivate many employees by mistake.
+
+The application calculates:
+
+`missing ratio = missing active employees / active employees before comparison`
+
+The threshold is configurable and defaults to 30%.
+
+- If fewer than 30% of active employees are missing, the run is marked ready to apply.
+- If 30% or more are missing, the run is put on hold and requires operator approval.
+- An attempt to apply a run before the required approval is rejected.
+
+This means a suspicious file does not automatically deactivate employees. An operator can inspect the preview and decide whether the file is correct before approving the changes.
+
+## 7. Hardest flow: applying changes and publishing events
+
+The application must update the employee record and make sure that other services are told about the change. It uses an outgoing event record, often called an **outbox**, for this.
+
+```mermaid
+sequenceDiagram
+  participant HR as HR system
+  participant API as Application
+  participant DB as PostgreSQL
+  participant Publisher as Background publisher
+  participant Kafka as Kafka
+  HR->>API: Employee update with version
+  API->>DB: Check and lock employee record
+  DB-->>API: Current employee version
+  alt Update is duplicate or older
+    API-->>HR: Ignore update
+  else Update is newer
+    API->>DB: Save employee change
+    API->>DB: Save outgoing event in same transaction
+    DB-->>API: Commit both records
+    API-->>HR: Confirm update
+    Publisher->>DB: Find pending outgoing events
+    Publisher->>Kafka: Send event
+    Publisher->>DB: Mark event as sent
   end
 ```
 
-- **Phase 1 (CSV Partitioning):** A dedicated streaming RFC-4180 parser reads the input stream character-by-character. It handles quoted fields with commas, escaped quotes (`""`), multi-line quoted fields, reordered headers, and missing optional fields. Each valid record is partitioned by `(employeeId.hashCode() & 0x7fffffff) % 256` into 256 temporary disk bucket files (`snapshot-{b}.txt`). Malformed rows are recorded in `invalidRows`.
-- **Phase 2 (Database Partitioning):** Stream database records via Hibernate cursor (`fetchSize = 1000`), hash into 256 database disk bucket files (`db-{b}.txt`).
-- **Phase 3 (Bucket-by-Bucket Comparison):** For bucket `b = 0..255`:
-  1. Load only `snapshot-{b}.txt` into an in-memory `LinkedHashMap<String, SnapshotRow>`.
-  2. Duplicate employee IDs in the CSV hash to the same bucket file and are detected and flagged in `invalidRows`.
-  3. Stream `db-{b}.txt` sequentially:
-     - If DB record is not in snapshot bucket $\rightarrow$ if active, record as **missing**.
-     - If DB record is in snapshot bucket $\rightarrow$ compare HR fields. If changed, record as **changed**. Remove key from snapshot map.
-  4. Any remaining records in the map were in the snapshot but not in DB $\rightarrow$ record as **new**.
-  5. Persist diff batch to staging tables `reconciliation_missing`, `reconciliation_changed`, `reconciliation_new`.
-  6. Clear memory map and proceed to bucket `b + 1`. Temporary files are removed immediately after diffing.
-- **Complexity Analysis:**
-  - **Time Complexity:** $O(N)$ streaming reads + $O(N)$ hashing + $O(N)$ bucket joins + $O(M)$ batch writes.
-  - **Memory Complexity:** Under uniform hash distribution, expected working heap memory is $O(N / 256)$ ($\approx 781$ records per bucket for 200,000 employees, $\approx 150 \text{ KB}$ heap usage per bucket). In the worst-case adversarial scenario where all identifiers produce the identical hash code, bucket size degrades to $O(N)$.
+The employee change and its outgoing event record are saved in the same database transaction. If that transaction fails, neither is saved. A background publisher sends pending events to Kafka.
 
-### 3. Safety Brake and Human-in-the-Loop Workflow
+Kafka delivery is **at least once**, not exactly once. If Kafka receives an event but the application stops before marking it as sent, the event may be sent again after recovery. Each event has a unique ID, and receiving services should use it to recognise duplicates.
 
-- Missing employee ratio: `missingRatio = missingCount / activeBefore`.
-- Safety brake threshold: `missingRatio >= 0.30` (30%).
-- If brake trips:
-  - Run status set to `AWAITING_APPROVAL`, `safetyBrake = true`.
-  - Calling `POST /api/v1/reconciliation/{runId}/apply` without approval fails with `HTTP 409 Conflict`.
-  - Operator must inspect preview details and invoke `POST /api/v1/reconciliation/{runId}/approve`.
-  - Once `APPROVED`, the operator invokes `POST /api/v1/reconciliation/{runId}/apply` to execute the changes.
+The publisher uses database row locking with `SKIP LOCKED` so multiple application instances can share pending work without selecting the same locked rows.
 
-### 4. Concurrency-Safe Atomic Apply
+## 8. Protecting the apply operation
 
-- To prevent race conditions from concurrent apply requests:
-  1. A pessimistic lock is acquired on the reconciliation run row: `SELECT status FROM reconciliation_runs WHERE id=? AND tenant_id=? FOR UPDATE`.
-  2. Only runs with status `READY_TO_APPLY` or `APPROVED` can be applied; if status is already `APPLIED`, the request is rejected with `RUN_ALREADY_APPLIED` (HTTP 409 Conflict).
-  3. The status is atomically transitioned to `APPLYING`.
-  4. Deactivations (with version increment), HR field updates (with version increment), and new employee insertions execute alongside transactional outbox generation within the single database transaction.
-  5. Upon completion, the status transitions to `APPLIED`.
-  6. Any runtime failure triggers an immediate transaction rollback, reverting the status transition and all staged mutations.
+Two requests might try to apply the same CSV preview at nearly the same time. The application locks the reconciliation run in the database before applying it.
 
-## Invariants
+The run moves through these states:
 
-1. `(tenant_id, employee_id)` identifies exactly one employee.
-2. Only a strictly greater HR source version can change HR-owned employee state.
-3. HR updates and reconciliation apply never write transport-owned columns (`pickup_point`, `special_assistance`).
-4. Employee mutation and outbox insertion share one database transaction.
-5. Missing-employee deactivation increments `source_version` and includes the incremented version in the outbox payload.
-6. A suspicious snapshot never deactivates employees automatically.
-7. Tenant scope comes from the authenticated principal; the caller-supplied tenant header must match it.
-8. Logs and public errors contain identifiers/codes only, never phone, email, name or pickup location.
+`READY_TO_APPLY / APPROVED → APPLYING → APPLIED`
 
-## Failure-mode table
+Only a run that is ready or approved can be applied. A second request cannot apply a run that is already applied. Employee changes, version increases and outgoing event records are part of the same transaction. If the transaction fails, the database rolls back those changes.
 
-| Failure | User/operator sees | Recovery |
+New employees start at version 1. Updating or deactivating an existing employee increases its version.
+
+## 9. Deactivation and cab bookings
+
+When an employee is deactivated, the application creates an outgoing event. The Kafka booking listener uses that event to cancel the employee's future confirmed cab bookings and release the reserved seat.
+
+The booking update is safe to receive more than once: a booking that is already cancelled is not cancelled again.
+
+## 10. Failure cases and recovery
+
+| What can go wrong? | What the system does | Recovery or protection |
 |---|---|---|
-| Duplicate event | `IGNORED / DUPLICATE_VERSION` | no write; safe replay |
-| Stale event | `IGNORED / STALE_VERSION` | newer state remains |
-| Invalid phone / office / fields | generic validation code | reject only that batch record; correct at source |
-| Tenant header does not match principal | HTTP 403 | authenticate as a member of the correct tenant |
-| DB unavailable | request fails; no success acknowledgment | retry with same event/version |
-| Process dies after DB commit | event remains pending in outbox | publisher resumes after restart |
-| Kafka unavailable | outbox remains pending; publish attempt is retried by later poll | monitor backlog; restore broker |
-| Kafka accepted but outbox mark fails | possible duplicate message | consumer uses event UUID; booking update is idempotent |
-| Snapshot is missing >= threshold | `AWAITING_APPROVAL` (safety brake) | investigate export; approve the persisted run before apply |
-| Unapproved apply attempt | HTTP 409 Conflict | must approve run first via `/{runId}/approve` |
-| Concurrent or duplicate apply | HTTP 409 Conflict (`RUN_ALREADY_APPLIED`) | safe rejection; no duplicate modifications or outbox records |
-| Booking cancellation fails | Kafka listener retries according to container error handling | restore booking DB and allow redelivery |
+| Same update arrives again | Ignores it as a duplicate | No second employee change |
+| Older update arrives late | Ignores it as stale | Newer employee data stays saved |
+| A record has invalid data | Rejects that record | Other valid batch records can still be processed |
+| A user tries to access another tenant | Rejects the request | Tenant is checked against the authenticated user |
+| Database is unavailable | The request fails | The source can retry the same version |
+| Kafka is unavailable | Outgoing event stays pending | Publisher retries later |
+| Application stops after saving an employee change | Outgoing event remains in PostgreSQL | Publisher can send it after restart |
+| Kafka receives an event but the sent status is not saved | Event may be delivered again | Consumer should recognise the unique event ID |
+| Nightly file is missing 30% or more of active employees | Run waits for approval | Operator checks the file before applying |
+| Two requests apply the same run | Database lock allows only a valid apply | Repeat apply is rejected |
 
-## Consistency, availability and latency trade-offs
+## 11. Trade-offs and current limits
 
-- Per-employee ordering favors consistency over write availability: transaction-scoped advisory locks serialize same-employee events, including first-time creates.
-- Different employees can be processed concurrently.
-- The API commits employee state and outbox before acknowledging success; Kafka availability does not block the HR write, but downstream propagation is eventual.
-- At-least-once Kafka publication is chosen over an unsupported exactly-once claim. Consumers should deduplicate using immutable `eventId`.
-- Multi-replica outbox polling uses `SELECT FOR UPDATE SKIP LOCKED` to prevent duplicate polling across instances.
-- Employee profile cache is Redis-backed with a two-minute TTL and explicit tenant-key eviction after successful writes; Redis is never authoritative.
-- Snapshot safety favors preventing false deactivations over immediate reconciliation. The implementation persists the preview, new, changed, and missing IDs in staging tables; a safety-brake run requires operator approval before the transactional apply step.
-- Hash partitioning trades temporary disk I/O for bounded working memory. Expected memory is $O(N/256)$.
+- **Correct ordering vs. write availability:** Updates for the same employee are protected with database locks. This helps keep the employee record correct, but requests for that employee may have to wait. Different employees can still be processed at the same time.
+- **Reliable event recording vs. immediate delivery:** The employee update is saved even if Kafka is temporarily unavailable. The event is delivered later, so other services may see the change after a short delay.
+- **Disk use vs. memory use:** Temporary disk files help avoid loading the full snapshot into memory. This adds disk reading and writing, and an uneven bucket distribution can increase memory use for one comparison.
+- **Cache freshness:** Employee profiles are cached in Redis for up to two minutes. Successful HR and transport writes evict the relevant cache entry. If an eviction is missed, the cached value can remain stale until its time-to-live expires. PostgreSQL remains the source of truth.
+- **Demo authentication:** The assessment uses in-memory HTTP Basic demo accounts. A real deployment should use company single sign-on and persistent access control.
+- **Outbox retention:** Published event rows are retained. A production deployment should add a cleanup or archive process.
+- **Performance evidence:** The recorded 200,000-row benchmark uses mocked database access and measures the file-processing algorithm. A separate PostgreSQL integration benchmark uses 5,000 rows. A full 200,000-row database-backed benchmark is still needed before claiming that the complete flow meets the case-study target of under 60 seconds.
+- **Failure testing:** Retry and recovery behavior is tested. A full test that kills the process at the exact point between the database commit and Kafka publication would provide stronger evidence for the case-study crash requirement.
+
+## 12. Main rules the implementation protects
+
+1. A tenant can access only its own employee records.
+2. An older or repeated source version cannot overwrite a newer employee record.
+3. HR updates do not change transport-owned fields.
+4. Employee changes and their outgoing event records are saved together.
+5. Deactivation increases the employee version.
+6. A suspicious nightly file cannot deactivate employees without approval.
+7. A reconciliation run cannot be applied twice.
+8. Personal employee details should not appear in logs or public error messages.
