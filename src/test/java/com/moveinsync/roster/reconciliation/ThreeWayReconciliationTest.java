@@ -498,5 +498,29 @@ class ThreeWayReconciliationTest {
         verify(jdbc, never()).batchUpdate(contains("reconciliation_changed"), anyList());
         verify(jdbc, never()).batchUpdate(contains("reconciliation_new"), anyList());
     }
-}
+    @Test
+    void testDuplicateEmployeeIdsInvalidateSnapshotAndPreventChanges() throws Exception {
+        when(repo.countByTenantIdAndActiveTrue("acme")).thenReturn(2L);
+        when(repo.streamAllForReconciliation("acme")).thenReturn(Stream.of(
+            new EmployeeSnapshotRecord("E1", "Asha", "asha@example.com", "M1", "BLR", null, true),
+            new EmployeeSnapshotRecord("E2", "Ravi", "ravi@example.com", "M1", "BLR", null, true)
+        ));
 
+        String csv = """
+            employeeId,name,email,managerId,officeCode,phone
+            E1,Asha,asha@example.com,M1,BLR,+919876543210
+            E1,Conflicting Asha,conflict@example.com,M2,HYD,+919876543211
+            """;
+
+        var report = service.preview("acme", new ByteArrayInputStream(csv.getBytes(StandardCharsets.UTF_8)));
+
+        assertEquals("INVALID_SNAPSHOT", report.status());
+        assertTrue(report.invalidRows().stream().anyMatch(row -> row.equals("duplicate:E1")));
+        assertEquals(1, report.estimatedMissing());
+        verify(jdbc).update(contains("status=?"), eq("INVALID_SNAPSHOT"),
+                anyLong(), anyLong(), anyDouble(), anyBoolean(), anyLong(), anyLong(), any(), eq("acme"));
+        verify(jdbc, never()).batchUpdate(contains("reconciliation_new"), anyList());
+        verify(jdbc, never()).batchUpdate(contains("reconciliation_changed"), anyList());
+    }
+
+}
