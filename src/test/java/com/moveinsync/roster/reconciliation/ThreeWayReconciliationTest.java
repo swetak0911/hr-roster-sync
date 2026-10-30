@@ -332,6 +332,9 @@ class ThreeWayReconciliationTest {
 
         // 13c: Apply approved run updates missing, changed, and new atomically
         when(jdbc.queryForObject(anyString(), eq(String.class), eq(runId), eq("acme"))).thenReturn("APPROVED");
+        when(jdbc.queryForObject(contains("count(*) from reconciliation_missing"), eq(Long.class), eq(runId), eq("acme"))).thenReturn(3L);
+        when(jdbc.queryForObject(contains("count(*) from reconciliation_changed"), eq(Long.class), eq(runId), eq("acme"))).thenReturn(2L);
+        when(jdbc.queryForObject(contains("count(*) from reconciliation_new"), eq(Long.class), eq(runId), eq("acme"))).thenReturn(1L);
         when(jdbc.update(contains("WITH deactivated"), eq(runId), eq("acme"))).thenReturn(3);
         when(jdbc.update(contains("WITH updated_emps"), eq(runId), eq("acme"))).thenReturn(2);
         when(jdbc.update(contains("WITH inserted_emps"), eq(runId), eq("acme"))).thenReturn(1);
