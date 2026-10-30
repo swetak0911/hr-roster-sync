@@ -35,8 +35,14 @@ public class ReconciliationController {
     public Map<String,Object> apply(@PathVariable UUID runId, @AuthenticationPrincipal TenantPrincipal principal,
             @RequestHeader("X-Tenant-Id") String tenant) {
         assertTenant(principal, tenant);
-        int deactivated = service.apply(principal.tenantId(), runId);
-        return Map.of("runId", runId.toString(), "status", "APPLIED", "deactivatedEmployees", deactivated);
+        ReconciliationService.ApplyResult result = service.apply(principal.tenantId(), runId);
+        return Map.of(
+            "runId", runId.toString(),
+            "status", "APPLIED",
+            "deactivatedEmployees", result.deactivated(),
+            "updatedEmployees", result.updated(),
+            "createdEmployees", result.created()
+        );
     }
 
     private void assertTenant(TenantPrincipal principal, String tenant) {
