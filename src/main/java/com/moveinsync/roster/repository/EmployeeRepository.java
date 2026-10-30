@@ -21,7 +21,7 @@ public interface EmployeeRepository extends JpaRepository<Employee,Long> {
     @QueryHints(@QueryHint(name="org.hibernate.fetchSize", value="1000"))
     Stream<String> streamActiveIds(@Param("tenant") String tenant);
 
-    @Query("select new com.moveinsync.roster.repository.EmployeeSnapshotRecord(e.employeeId, e.name, e.email, e.managerId, e.officeCode, e.phone, e.active) from Employee e where e.tenantId=:tenant")
+    @Query("select new com.moveinsync.roster.repository.EmployeeSnapshotRecord(e.employeeId, e.name, e.email, e.managerId, e.officeCode, e.phone, e.active, e.sourceVersion) from Employee e where e.tenantId=:tenant")
     @QueryHints(@QueryHint(name="org.hibernate.fetchSize", value="1000"))
     Stream<EmployeeSnapshotRecord> streamAllForReconciliation(@Param("tenant") String tenant);
 }
