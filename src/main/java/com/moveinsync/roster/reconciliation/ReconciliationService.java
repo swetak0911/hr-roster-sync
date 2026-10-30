@@ -57,6 +57,7 @@ public class ReconciliationService {
         long newCount = 0;
         long changedCount = 0;
         long unidentifiableRows = 0;
+        boolean duplicateRowsDetected = false;
 
         try {
             Path[] snapshotBuckets = createBuckets(work, "snapshot-");
@@ -137,10 +138,11 @@ public class ReconciliationService {
 
             // Phase 2: Partition DB records into 256 disk buckets
             try (WriterGroup dbWriters = new WriterGroup(dbBuckets)) {
-                try (Stream<EmployeeSnapshotRecord> dbStream = employees.streamAllForReconciliation(tenant)) {
-                    if (dbStream == null) {
-                        throw new IllegalStateException("DATABASE_STREAM_UNAVAILABLE");
-                    }
+                Stream<EmployeeSnapshotRecord> dbStream = employees.streamAllForReconciliation(tenant);
+                if (dbStream == null) {
+                    throw new IllegalStateException("DATABASE_STREAM_UNAVAILABLE");
+                }
+                try (dbStream) {
                     dbStream.forEach(rec -> {
                         try {
                             dbWriters.writer(bucket(rec.employeeId())).write(
@@ -169,6 +171,7 @@ public class ReconciliationService {
                         if (snapshotMap.containsKey(snap.employeeId())) {
                             if (invalidRows.size() < 100) invalidRows.add("duplicate:" + snap.employeeId());
                             else invalidRowsTruncated++;
+                            duplicateRowsDetected = true;
                             continue;
                         }
                         snapshotMap.put(snap.employeeId(), snap);
@@ -239,14 +242,17 @@ public class ReconciliationService {
 
             double ratio = activeCount == 0 ? 0.0 : (double) missingCount / activeCount;
             boolean brake = ratio >= missingThreshold;
-            String status = brake ? "AWAITING_APPROVAL" : "READY_TO_APPLY";
+            // Duplicate IDs make the source snapshot ambiguous; never allow approval or apply.
+            String status = duplicateRowsDetected ? "INVALID_SNAPSHOT"
+                    : (brake ? "AWAITING_APPROVAL" : "READY_TO_APPLY");
 
             jdbc.update("update reconciliation_runs set status=?,snapshot_rows=?,estimated_missing=?,missing_ratio=?,safety_brake=?,estimated_new=?,estimated_changed=? where id=? and tenant_id=?",
                     status, snapshotRows, missingCount, ratio, brake, newCount, changedCount, runId, tenant);
 
+            String reportStatus = duplicateRowsDetected ? "INVALID_SNAPSHOT"
+                    : (brake ? "SAFETY_BRAKE_APPROVAL_REQUIRED" : "READY_TO_APPLY");
             return new ReconciliationReport(runId, activeCount, snapshotRows, missingCount, ratio, brake,
-                    brake ? "SAFETY_BRAKE_APPROVAL_REQUIRED" : "READY_TO_APPLY",
-                    invalidRows, invalidRowsTruncated, newCount, changedCount);
+                    reportStatus, invalidRows, invalidRowsTruncated, newCount, changedCount);
 
         } catch (Exception ex) {
             jdbc.update("delete from reconciliation_missing where run_id=? and tenant_id=?", runId, tenant);
