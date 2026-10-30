@@ -25,6 +25,9 @@ class ReconciliationApprovalTest {
         ReconciliationService service = new ReconciliationService(employees, 0.30, jdbc);
         UUID runId = UUID.randomUUID();
         when(jdbc.queryForObject(anyString(), eq(String.class), eq(runId), eq("acme"))).thenReturn("APPROVED");
+        when(jdbc.queryForObject(contains("count(*) from reconciliation_missing"), eq(Long.class), eq(runId), eq("acme"))).thenReturn(42L);
+        when(jdbc.queryForObject(contains("count(*) from reconciliation_changed"), eq(Long.class), eq(runId), eq("acme"))).thenReturn(0L);
+        when(jdbc.queryForObject(contains("count(*) from reconciliation_new"), eq(Long.class), eq(runId), eq("acme"))).thenReturn(0L);
         when(jdbc.update(contains("WITH deactivated"), eq(runId), eq("acme"))).thenReturn(42);
         assertEquals(42, service.apply("acme", runId).deactivated());
         verify(jdbc).update(contains("status='APPLIED'"), eq(runId), eq("acme"));
