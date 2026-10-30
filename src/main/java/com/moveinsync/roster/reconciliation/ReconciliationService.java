@@ -23,7 +23,7 @@ public class ReconciliationService {
     private final JdbcTemplate jdbc;
 
     public record SnapshotRow(String employeeId, String name, String email, String managerId, String officeCode, String phone, boolean valid) {}
-    public record DbRow(String employeeId, String name, String email, String managerId, String officeCode, String phone, boolean active) {}
+    public record DbRow(String employeeId, String name, String email, String managerId, String officeCode, String phone, boolean active, long sourceVersion) {}
     public record ApplyResult(int deactivated, int updated, int created) {}
 
     public ReconciliationService(EmployeeRepository employees,
@@ -146,7 +146,7 @@ public class ReconciliationService {
                     dbStream.forEach(rec -> {
                         try {
                             dbWriters.writer(bucket(rec.employeeId())).write(
-                                encodeRow(rec.employeeId(), rec.name(), rec.email(), rec.managerId(), rec.officeCode(), rec.phone(), String.valueOf(rec.active()))
+                                encodeRow(rec.employeeId(), rec.name(), rec.email(), rec.managerId(), rec.officeCode(), rec.phone(), String.valueOf(rec.active()), String.valueOf(rec.sourceVersion()))
                             );
                         } catch (IOException e) {
                             throw new UncheckedIOException(e);
@@ -188,7 +188,7 @@ public class ReconciliationService {
                             // In DB, absent in snapshot
                             if (db.active()) {
                                 missingCount++;
-                                missingBatch.add(new Object[]{runId, tenant, db.employeeId()});
+                                missingBatch.add(new Object[]{runId, tenant, db.employeeId(), db.sourceVersion()});
                                 if (missingBatch.size() >= DB_BATCH_SIZE) flushMissing(missingBatch);
                             }
                         } else if (snap.valid()) {
@@ -204,7 +204,7 @@ public class ReconciliationService {
                                 changedBatch.add(new Object[]{
                                     runId, tenant, snap.employeeId(),
                                     snap.name(), snap.email(), snap.managerId(), snap.officeCode(), snap.phone(),
-                                    db.name(), db.email(), db.managerId(), db.officeCode()
+                                    db.name(), db.email(), db.managerId(), db.officeCode(), db.sourceVersion()
                                 });
                                 if (changedBatch.size() >= DB_BATCH_SIZE) flushChanged(changedBatch);
                             }
@@ -308,12 +308,16 @@ public class ReconciliationService {
         jdbc.update("update reconciliation_runs set status='APPLYING' where id=? and tenant_id=?", runId, tenant);
 
         // 1. Deactivate missing active employees (advancing source_version by 1)
+        long expectedMissing = jdbc.queryForObject("select count(*) from reconciliation_missing where run_id=? and tenant_id=?", Long.class, runId, tenant);
+        long expectedChanged = jdbc.queryForObject("select count(*) from reconciliation_changed where run_id=? and tenant_id=?", Long.class, runId, tenant);
+        long expectedNew = jdbc.queryForObject("select count(*) from reconciliation_new where run_id=? and tenant_id=?", Long.class, runId, tenant);
+
         String deactSql = """
             WITH deactivated AS (
               UPDATE employees e SET active=false, source_version=e.source_version + 1, updated_at=now()
               FROM reconciliation_missing m
               WHERE m.run_id=? AND m.tenant_id=? AND e.tenant_id=m.tenant_id
-                AND e.employee_id=m.employee_id AND e.active=true
+                AND e.employee_id=m.employee_id AND e.active=true AND e.source_version=m.expected_source_version
               RETURNING e.tenant_id,e.employee_id,e.source_version
             ), event_rows AS (
               SELECT gen_random_uuid() AS id,tenant_id,employee_id,source_version FROM deactivated
@@ -325,6 +329,7 @@ public class ReconciliationService {
             FROM event_rows
             """;
         int deactivated = jdbc.update(deactSql, runId, tenant);
+        if (deactivated != expectedMissing) throw new IllegalStateException("RECONCILIATION_VERSION_CONFLICT: employee changed after preview");
 
         // 2. Update changed employees (HR fields only, preserve transport fields, advance version by 1)
         String updateSql = """
@@ -333,7 +338,7 @@ public class ReconciliationService {
               SET name=c.name, email=c.email, manager_id=c.manager_id, office_code=c.office_code,
                   phone=COALESCE(NULLIF(c.phone,''), e.phone), active=true, source_version=e.source_version + 1, updated_at=now()
               FROM reconciliation_changed c
-              WHERE c.run_id=? AND c.tenant_id=? AND e.tenant_id=c.tenant_id AND e.employee_id=c.employee_id
+              WHERE c.run_id=? AND c.tenant_id=? AND e.tenant_id=c.tenant_id AND e.employee_id=c.employee_id AND e.source_version=c.expected_source_version
               RETURNING e.tenant_id,e.employee_id,e.source_version,e.name,e.email,e.manager_id,e.office_code,e.phone
             ), event_rows AS (
               SELECT gen_random_uuid() AS id, tenant_id, employee_id, source_version, name, email, manager_id, office_code, phone
@@ -347,6 +352,7 @@ public class ReconciliationService {
             FROM event_rows
             """;
         int updated = jdbc.update(updateSql, runId, tenant);
+        if (updated != expectedChanged) throw new IllegalStateException("RECONCILIATION_VERSION_CONFLICT: employee changed after preview");
 
         // 3. Insert new employees (default version 1, active=true, transport fields defaults)
         String insertSql = """
@@ -369,6 +375,7 @@ public class ReconciliationService {
             FROM event_rows
             """;
         int created = jdbc.update(insertSql, runId, tenant);
+        if (created != expectedNew) throw new IllegalStateException("RECONCILIATION_VERSION_CONFLICT: employee was created after preview");
 
         jdbc.update("update reconciliation_runs set status='APPLIED',applied_at=now() where id=? and tenant_id=?", runId, tenant);
         return new ApplyResult(deactivated, updated, created);
@@ -433,7 +440,8 @@ public class ReconciliationService {
         String office = tokens.length > 4 ? decodeField(tokens[4]) : "";
         String phone = tokens.length > 5 ? decodeField(tokens[5]) : "";
         boolean active = tokens.length > 6 && Boolean.parseBoolean(tokens[6]);
-        return new DbRow(id, name, email, manager, office, phone, active);
+        long sourceVersion = tokens.length > 7 ? Long.parseLong(tokens[7]) : 0L;
+        return new DbRow(id, name, email, manager, office, phone, active, sourceVersion);
     }
 
     private String getRunStatus(String tenant, UUID runId) {
@@ -443,7 +451,7 @@ public class ReconciliationService {
 
     private void flushMissing(List<Object[]> batch) {
         if (batch.isEmpty()) return;
-        jdbc.batchUpdate("insert into reconciliation_missing(run_id,tenant_id,employee_id) values (?,?,?) on conflict do nothing", batch);
+        jdbc.batchUpdate("insert into reconciliation_missing(run_id,tenant_id,employee_id,expected_source_version) values (?,?,?,?) on conflict do nothing", batch);
         batch.clear();
     }
 
@@ -455,7 +463,7 @@ public class ReconciliationService {
 
     private void flushChanged(List<Object[]> batch) {
         if (batch.isEmpty()) return;
-        jdbc.batchUpdate("insert into reconciliation_changed(run_id,tenant_id,employee_id,name,email,manager_id,office_code,phone,old_name,old_email,old_manager_id,old_office_code) values (?,?,?,?,?,?,?,?,?,?,?,?) on conflict do nothing", batch);
+        jdbc.batchUpdate("insert into reconciliation_changed(run_id,tenant_id,employee_id,name,email,manager_id,office_code,phone,old_name,old_email,old_manager_id,old_office_code,expected_source_version) values (?,?,?,?,?,?,?,?,?,?,?,?,?) on conflict do nothing", batch);
         batch.clear();
     }
 
