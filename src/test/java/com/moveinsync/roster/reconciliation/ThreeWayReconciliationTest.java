@@ -521,6 +521,13 @@ class ThreeWayReconciliationTest {
                 anyLong(), anyLong(), anyDouble(), anyBoolean(), anyLong(), anyLong(), any(), eq("acme"));
         verify(jdbc, never()).batchUpdate(contains("reconciliation_new"), anyList());
         verify(jdbc, never()).batchUpdate(contains("reconciliation_changed"), anyList());
+
+        when(jdbc.queryForObject(anyString(), eq(String.class), eq(report.runId()), eq("acme")))
+                .thenReturn("INVALID_SNAPSHOT");
+        assertThrows(IllegalStateException.class, () -> service.apply("acme", report.runId()));
+        verify(jdbc, never()).update(contains("WITH deactivated"), eq(report.runId()), eq("acme"));
+        verify(jdbc, never()).update(contains("WITH updated_emps"), eq(report.runId()), eq("acme"));
+        verify(jdbc, never()).update(contains("WITH inserted_emps"), eq(report.runId()), eq("acme"));
     }
 
 }
