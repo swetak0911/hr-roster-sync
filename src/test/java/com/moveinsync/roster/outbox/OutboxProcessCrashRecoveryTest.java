@@ -120,11 +120,20 @@ class OutboxProcessCrashRecoveryTest {
         consumerProperties.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         try (Consumer<String, String> consumer = new KafkaConsumer<>(
                 consumerProperties, new StringDeserializer(), new StringDeserializer())) {
-            consumer.subscribe(java.util.List.of("employee-changes"));
+            // Assign the embedded topic partition before publishing. Without an initial poll,
+            // KafkaConsumer has not joined the group yet and the test can race its assignment.
+            embeddedKafka.consumeFromAnEmbeddedTopic(consumer, "employee-changes");
+            consumer.poll(Duration.ofMillis(250));
 
             TransactionTemplate transaction = new TransactionTemplate(transactionManager);
             transaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
             transaction.executeWithoutResult(status -> restartedPublisher.publishOne(eventId));
+
+            Integer publishedRows = jdbc.queryForObject(
+                    "SELECT count(*) FROM outbox_events WHERE id=? AND published_at IS NOT NULL",
+                    Integer.class, eventId);
+            assertEquals(1, publishedRows,
+                    "Publisher should mark the outbox event published only after Kafka acknowledges the send");
 
             ConsumerRecord<String, String> delivered = null;
             long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
