@@ -200,7 +200,8 @@ class ReconciliationPostgresIntegrationBenchmarkTest {
 
         IllegalStateException conflict = assertThrows(IllegalStateException.class,
                 () -> service.apply(TENANT, report.runId()));
-        assertTrue(conflict.getMessage().contains("RECONCILIATION_VERSION_CONFLICT"));
+        assertTrue(conflict.getMessage().contains("RECONCILIATION_VERSION_CONFLICT"),
+                "Expected optimistic version conflict but got: " + conflict.getMessage());
 
         assertEquals("Live Event Name", jdbc.queryForObject(
                 "SELECT name FROM employees WHERE tenant_id=? AND employee_id=?",
