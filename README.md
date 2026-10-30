@@ -197,7 +197,7 @@ Run the automated tests:
 mvn clean test
 ```
 
-The test suite includes **60 automated tests** across 13 test classes covering stale/duplicate event handling, out-of-order versions, transport field preservation, deactivation semantics, RFC-4180 streaming CSV parsing across buffer boundaries, safe record-level handling of malformed rows, safety-brake threshold enforcement, concurrent apply and approval row-locking, outbox publishing with `SKIP LOCKED`, and end-to-end reconciliation diffing. All 60 tests pass with 0 failures, 0 errors, and 0 skipped. The application was also started with Docker Compose, and its health endpoint returned `UP`.
+The normal test suite includes **61 automated tests** across 13 test classes covering stale/duplicate event handling, out-of-order versions, transport field preservation, deactivation semantics, RFC-4180 streaming CSV parsing across buffer boundaries, safe record-level handling of malformed rows, safety-brake threshold enforcement, concurrent apply and approval row-locking, outbox publishing with `SKIP LOCKED`, and end-to-end reconciliation diffing. The latest local run completed with 61 tests passing, 0 failures, 0 errors, and 0 skipped. The application was also started with Docker Compose, and its health endpoint returned `UP`.
 
 ### Automated Test Suite Overview
 
@@ -219,11 +219,11 @@ The test suite includes **60 automated tests** across 13 test classes covering s
 
 ### Recorded performance checks
 
-- **200,000-row mock benchmark:** approximately 1.98-5.70 seconds. This checks the file-processing algorithm with mocked database access. It is not a full 200,000-row PostgreSQL end-to-end test.
-- **5,000-row PostgreSQL integration benchmark:** approximately 2.20-3.72 seconds in the recorded run. This uses a real PostgreSQL test container and checks the database comparison and staging flow.
+- **200,000-row mock benchmark:** approximately 1.98-5.70 seconds. This checks the file-processing algorithm with mocked database access.
+- **5,000-row PostgreSQL integration benchmark:** approximately 2.20-3.72 seconds in an earlier recorded run.
+- **200,000-row PostgreSQL integration benchmark (latest local run):** 16,455 ms preview and 3,286 ms apply. The test seeded 200,000 real PostgreSQL employee rows, processed a 200,000-row CSV snapshot, detected 20,000 missing and 20,000 new employees, deactivated the 20,000 missing employees, inserted the 20,000 new employees, and verified 40,000 outbox events. The benchmark test completed in 33.84 seconds; Maven completed in 43.504 seconds. Result: 1 test passed, 0 failures, 0 errors, 0 skipped.
 
-
-These results are measurements from the test environment, not a guarantee for every machine. The case study asks for a 200,000-row diff in under 60 seconds with bounded memory. The 200,000-row mock benchmark is useful evidence for the comparison algorithm, but a full 200,000-row database benchmark is still needed to claim that the complete database-backed flow meets that target.
+The 200,000-row database-backed preview completed under the case-study target of 60 seconds in this test environment. These are measurements from one machine/run, not a guarantee for every deployment. Disk buckets reduce memory use by partitioning the comparison, but a heavily skewed bucket distribution can still increase peak memory; this benchmark does not by itself prove a strict worst-case memory bound.
 ## Design choices and limitations
 
 - **Employee ordering:** Updates for one employee are protected using database locks and source versions. This favours correct ordering over allowing simultaneous writes to the same employee.
