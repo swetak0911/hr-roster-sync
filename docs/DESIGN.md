@@ -10,23 +10,26 @@ The implementation uses source versions, tenant-aware authorization, PostgreSQL 
 
 ## 2. Architecture
 
-    flowchart LR
-      HR[HR source] -->|Versioned events| API[Spring Boot API]
-      HR -->|Nightly CSV| PARSER[Streaming CSV parser]
-      API --> EMP[(PostgreSQL)]
-      PARSER --> BUCKETS[Disk-backed hash buckets]
-      EMP --> BUCKETS
-      BUCKETS --> STAGE[New / changed / missing staging]
-      STAGE --> BRAKE[30% safety brake + approval]
-      BRAKE -->|Apply with version checks| EMP
-      API --> OUTBOX[(Transactional outbox)]
-      EMP --> OUTBOX
-      OUTBOX --> PUBLISHER[Outbox publisher]
-      PUBLISHER --> KAFKA[Kafka]
-      KAFKA --> LISTENER[Deactivation listener]
-      LISTENER --> BOOKINGS[Cancel future bookings / free seats]
-      API <--> REDIS[(Redis profile cache)]
-      TRANSPORT[Transport admin] --> API
+~~~mermaid
+flowchart LR
+  HR[HR source] -->|Versioned events| API[Spring Boot API]
+  HR -->|Nightly CSV| PARSER[Streaming CSV parser]
+  API --> EMP[(PostgreSQL)]
+  PARSER --> BUCKETS[Disk-backed hash buckets]
+  EMP --> BUCKETS
+  BUCKETS --> STAGE[New / changed / missing staging]
+  STAGE --> BRAKE[30% safety brake + approval]
+  BRAKE -->|Apply with version checks| EMP
+  API --> OUTBOX[(Transactional outbox)]
+  EMP --> OUTBOX
+  OUTBOX --> PUBLISHER[Outbox publisher]
+  PUBLISHER --> KAFKA[Kafka]
+  KAFKA --> LISTENER[Deactivation listener]
+  LISTENER --> BOOKINGS[Cancel future bookings / free seats]
+  API <--> REDIS[(Redis profile cache)]
+  TRANSPORT[Transport admin] --> API
+
+~~~
 
 - **Spring Boot API:** event ingestion, transport-profile updates, employee reads and reconciliation.
 - **PostgreSQL 16:** employees, reconciliation runs/staging rows and outbox events; Flyway manages schema migrations.
@@ -73,27 +76,30 @@ The deactivation consumer cancels future confirmed cab bookings and releases res
 
 ### Event sequence
 
-    sequenceDiagram
-      participant HR as HR system
-      participant API as Spring Boot API
-      participant DB as PostgreSQL
-      participant P as Outbox publisher
-      participant K as Kafka
-      participant B as Booking consumer
-      HR->>API: Employee event (source version)
-      API->>DB: Lock/check employee version
-      alt Duplicate or stale
-        API-->>HR: No-op result
-      else Newer valid event
-        API->>DB: Update employee + insert outbox row
-        DB-->>API: Commit transaction
-        API-->>HR: Accepted
-        P->>DB: Claim pending row (SKIP LOCKED)
-        P->>K: Publish event ID + payload
-        K-->>B: Deactivation event
-        B->>B: Cancel future confirmed rides; release seats
-        P->>DB: Mark event published
-      end
+~~~mermaid
+sequenceDiagram
+  participant HR as HR system
+  participant API as Spring Boot API
+  participant DB as PostgreSQL
+  participant P as Outbox publisher
+  participant K as Kafka
+  participant B as Booking consumer
+  HR->>API: Employee event (source version)
+  API->>DB: Lock/check employee version
+  alt Duplicate or stale
+    API-->>HR: No-op result
+  else Newer valid event
+    API->>DB: Update employee + insert outbox row
+    DB-->>API: Commit transaction
+    API-->>HR: Accepted
+    P->>DB: Claim pending row (SKIP LOCKED)
+    P->>K: Publish event ID + payload
+    K-->>B: Deactivation event
+    B->>B: Cancel future confirmed rides; release seats
+    P->>DB: Mark event published
+  end
+
+~~~
 
 ## 6. Failure-mode analysis
 
