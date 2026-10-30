@@ -1,88 +1,124 @@
-# HR Roster Sync — MoveInSync Case Study 5
+# HR Roster Sync – MoveInSync Case Study 5
 
-Java 21 / Spring Boot implementation of the HR roster synchronization case study. The code is structured around tenant-scoped employee state, monotonic source versions, HR/transport ownership, a transactional outbox, streaming snapshot comparison, and idempotent booking cancellation.
+## About this project
 
-> **Submission status:** Fully build-verified and tested in this environment. All 39 automated unit, concurrency (Testcontainers), benchmark, three-way reconciliation diff, and MockMvc API integration tests pass. The critical HTTP 500 authentication principal bug has been root-caused and resolved with regression tests.
+This project is my Java backend solution for **MoveInSync's Case Study 5: HR Roster Sync – Idempotent, Out-of-Order, Self-Healing**.
 
-## Implemented behavior
+MoveInSync receives employee information from corporate clients. That information can arrive more than once, arrive in the wrong order, contain invalid data, or come through an incomplete nightly file. Some details are managed by HR, while others are managed by the transport team.
 
-| Requirement | Implementation |
+The goal of this project is to keep employee records correct even when these problems happen.
+
+## What the case study asks for
+
+| Case-study requirement | What this project does |
 |---|---|
-| Create/update/deactivate | `POST /api/v1/events`; deactivation needs only tenant, employee, type and version |
-| Boundary validation | Bean Validation for payloads, E.164-style optional phone validation, office-code allow-list |
-| Per-record batch errors | `POST /api/v1/events/batch` validates and processes each JSON record independently; error responses contain codes and employee IDs only |
-| Idempotency/order | Key is `(tenantId, employeeId, sourceVersion)`; equal version is duplicate, lower version is stale, higher version is applied |
-| Concurrent first create | PostgreSQL transaction-scoped advisory lock serializes events even when no employee row exists yet; employee row lock serializes updates; unique tenant/employee constraint is final guard |
-| Field ownership | HR writes name/email/manager/office/phone/active/version; transport admin writes pickup point and special-assistance only |
-| Nightly 3-way diff | CSV and DB snapshot streamed into 256 disk buckets; bucket-by-bucket join detects (1) New, (2) Changed (HR fields only), and (3) Missing active employees |
-| Safety brake | Configurable threshold (`MISSING_EMPLOYEE_THRESHOLD`, default `0.30`); a run at/above threshold is persisted as `AWAITING_APPROVAL`; apply is blocked with HTTP 409 until approved |
-| Staging tables | Previews persist diff results to `reconciliation_new`, `reconciliation_changed`, and `reconciliation_missing` without mutating production data |
-| Outbox | Employee mutation and outbox insert share one transaction; event UUID is included in the payload |
-| Booking side effect | Kafka deactivation consumer cancels future confirmed bookings and releases their seat reservation; repeated delivery is safe |
-| Authentication / tenant isolation | HTTP Basic demo users have explicit tenant assignments; all APIs compare the requested tenant with the authenticated principal; roles are enforced with method security |
-| Caching | Redis cache for employee profile reads; HR and transport writes evict the tenant-scoped key |
-| Monitoring | Actuator health/metrics endpoints, applied/ignored/rejected counters, outbox pending depth, oldest pending age, publish attempts and failures |
-| Structured logging | JSON-formatted console pattern; API errors avoid echoing submitted values |
+| Receive employee create, update and deactivate events | Provides APIs to receive employee changes |
+| Reject invalid records without failing a whole batch | Validates records and reports errors per record |
+| Ignore duplicate and older updates | Uses an employee's source version to decide whether an update is new, repeated or old |
+| Keep HR and transport fields separate | HR updates do not overwrite pickup point or special-assistance details |
+| Compare a nightly file of up to 200,000 employees without loading everything into memory | Reads the CSV and database records in streams and compares them using temporary disk buckets |
+| Stop unsafe mass deactivation | Pauses a run when 30% or more of active employees are missing and waits for operator approval |
+| Publish reliable change events | Saves employee changes and outgoing event records in one database transaction, then publishes through Kafka |
+| Cancel future cab bookings when an employee leaves | A Kafka consumer cancels future confirmed bookings and releases the reserved seat |
+| Protect client data | Checks the authenticated user's tenant and role |
+| Provide monitoring, caching and safe error handling | Includes health/metrics endpoints, Redis profile caching and non-sensitive error responses |
 
-## Important design contracts
+## How it works
 
-### Version and idempotency
+There are two ways employee information enters the application:
 
-Employee profile reads use a Redis cache with a 2-minute TTL. HR and transport writes evict the exact `(tenant, employee)` cache key. If an eviction is missed, staleness is bounded by the TTL; Redis is not the source of truth.
+1. **Employee event API:** HR sends an event when an employee joins, changes details or leaves.
+2. **Nightly CSV file:** HR sends a full employee list. The application compares it with the employee records already stored.
 
-The source must provide a monotonically increasing integer version per employee. The idempotency key is `(tenantId, employeeId, version)`. An event is applied only when `version > storedVersion`. A same-version replay is `IGNORED / DUPLICATE_VERSION`; a lower version is `IGNORED / STALE_VERSION`. A PostgreSQL advisory transaction lock keyed by tenant and employee protects concurrent first-time creates, while `SELECT ... FOR UPDATE` protects existing employee rows.
+For an event, the application checks the employee's version. If the same version was already processed, it ignores the duplicate. If an older version arrives after a newer one, it ignores the old update. A newer version can be applied.
 
-### Ownership
+For the nightly file, the application prepares three lists:
 
-HR owns `name`, `email`, `managerId`, `officeCode`, `phone`, `active`, and `sourceVersion`. Transport administration owns `pickupPoint` and `specialAssistance`. HR updates never assign transport-owned properties. A deactivation advances the version and changes only `active`; it does not blank the employee profile.
+- **New:** present in the file but not in the database.
+- **Changed:** present in both, but an HR-managed detail has changed.
+- **Missing:** active in the database but absent from the file.
 
-### Outbox and delivery semantics
+The preview does not change live employee records. If 30% or more of active employees appear to be missing, the application pauses the run until an operator approves it.
 
-The employee update and outbox row commit atomically. A scheduled publisher polls pending rows using `SELECT FOR UPDATE SKIP LOCKED` to allow multiple application replicas to poll and publish concurrently without duplicate processing. Delivery is **at least once**: if Kafka accepts a message but the process dies before the outbox `published_at` update commits, the message can be sent again. The immutable `eventId` is part of the payload; downstream consumers should deduplicate on it. The booking cancellation SQL is independently idempotent because it only changes future `CONFIRMED` bookings.
+## Field ownership
 
-### Three-Way Snapshot Reconciliation and Bounded Memory
+| HR manages | Transport admin manages |
+|---|---|
+| Name | Pickup point |
+| Email | Special-assistance needs |
+| Manager | |
+| Office | |
+| Phone | |
+| Active/inactive status | |
 
-`POST /api/v1/reconciliation/preview` parses incoming CSV snapshots using a streaming RFC-4180 compliant parser and compares them against database employee records to compute a complete 3-way diff:
-1. **New employees**: present in snapshot, absent in DB $\rightarrow$ staged in `reconciliation_new`.
-2. **Changed employees**: present in both, with changes to HR-owned fields (`name`, `email`, `managerId`, `officeCode`, or reactivation) $\rightarrow$ staged in `reconciliation_changed`. Transport fields (`pickupPoint`, `specialAssistance`) are completely untouched.
-3. **Missing active employees**: active in DB, absent in snapshot $\rightarrow$ staged in `reconciliation_missing`.
+An HR update changes only HR-managed fields. Transport details are preserved.
 
-The parser natively handles quoted fields with commas, escaped double quotes (`""`), multi-line quoted fields, reordered headers, and missing optional fields. Both the CSV stream and the database snapshot stream are partitioned to 256 disk bucket files by hashing the employee ID (`(hash & 0x7fffffff) % 256`). The implementation reads only one snapshot bucket into memory at a time, detects duplicate employee IDs within each bucket file, joins against the corresponding database disk bucket, and flushes the diff to PostgreSQL staging tables.
+## Technology
 
-**Memory Complexity:** Under uniform hash distribution, expected working heap memory is $O(N / 256)$ ($\approx 781$ records per bucket for 200,000 employees). In the theoretical worst-case adversarial scenario where all employee IDs hash to a single bucket, bucket size degrades to $O(N)$. Disk buckets are temporary and removed immediately after processing.
+| Technology | Purpose |
+|---|---|
+| Java 21 | Backend programming language |
+| Spring Boot | REST APIs and application structure |
+| PostgreSQL | Employee records, reconciliation results and outgoing events |
+| Flyway | Database schema changes |
+| Redis | Employee profile cache |
+| Apache Kafka | Sends employee-change events to other services |
+| Docker Compose | Starts the application and required services |
+| Maven | Build and test commands |
 
-**Safety Brake & Atomic Apply:**
-- `missingRatio = missingCount / activeBefore`.
-- A run below 30% missing becomes `READY_TO_APPLY`.
-- A run at or above 30% (`missingRatio >= 0.30`) triggers the safety brake and becomes `AWAITING_APPROVAL`.
-- Calling `/apply` on an unapproved run returns `HTTP 409 Conflict`.
-- Once approved via `POST /api/v1/reconciliation/{runId}/approve`, `/apply` is concurrency-safe: it acquires a pessimistic row lock (`SELECT ... FOR UPDATE`), transitions status (`READY_TO_APPLY/APPROVED -> APPLYING -> APPLIED`), and atomically executes deactivations (incrementing `source_version = source_version + 1`), HR field updates (incrementing `source_version = source_version + 1`), and insertions (`source_version = 1`), emitting transactional outbox events with the incremented versions.
-- Concurrent or repeated apply attempts on an already `APPLIED` run are rejected with `HTTP 409 Conflict` (`RUN_ALREADY_APPLIED`) without modifying employee versions or creating extra outbox events.
+## Run the project
 
-### Run with one command
+### Requirements
 
-Requirements: Docker and Docker Compose.
+- Docker Desktop with Docker Compose
+- JDK 21 and Maven 3.9+ if you want to run the application directly with Maven
+
+### Start everything with Docker
+
+From the project folder:
 
 ```bash
-cp .env.example .env   # edit the passwords first
+cp .env.example .env
+```
+
+Open `.env` and change the demo passwords. Then run:
+
+```bash
 docker compose up --build
 ```
 
-This starts PostgreSQL, Redis, Kafka and the Spring Boot API. The API listens on `http://localhost:8080`; health is `http://localhost:8080/actuator/health`.
+The API runs at `http://localhost:8080`.
 
-For local Maven development, start dependencies only:
+Check that it is running:
+
+```text
+http://localhost:8080/actuator/health
+```
+
+A healthy application returns:
+
+```json
+{"status":"UP"}
+```
+
+### Run the application with Maven
+
+Start the supporting services first:
 
 ```bash
 docker compose up -d postgres redis kafka
-# Linux/macOS
-KAFKA_BOOTSTRAP_SERVERS=localhost:9094 mvn spring-boot:run
-# Windows PowerShell
-$env:KAFKA_BOOTSTRAP_SERVERS="localhost:9094"; mvn spring-boot:run
 ```
 
-Requirements for local build: JDK 21 and Maven 3.9+.
+On Windows PowerShell:
 
-### Demo accounts
+```powershell
+$env:KAFKA_BOOTSTRAP_SERVERS="localhost:9094"
+mvn spring-boot:run
+```
+
+## Demo accounts
+
+These accounts are for local assessment/demo use. Change the passwords before sharing the running application.
 
 | Username | Role | Tenant | Default password |
 |---|---|---|---|
@@ -92,11 +128,13 @@ Requirements for local build: JDK 21 and Maven 3.9+.
 | `globex-operator` | OPERATOR | `globex` | `globex-change-me` |
 | `employee-e1001` | EMPLOYEE (own profile only) | `acme` | `employee-change-me` |
 
-Override passwords with environment variables before starting Compose, including `EMPLOYEE_PASSWORD`. These in-memory HTTP Basic accounts are for assessment demonstration only; replace with OIDC/JWT and persistent tenant membership for production.
+The assessment version uses in-memory demo accounts and HTTP Basic authentication. A production deployment should use an enterprise identity provider and persistent role/tenant management.
 
-## API examples
+## Main API examples
 
-Create an employee:
+The examples below use the `acme` tenant and the local demo account.
+
+### Add an employee
 
 ```bash
 curl -u operator:change-me -X POST http://localhost:8080/api/v1/events \
@@ -104,13 +142,9 @@ curl -u operator:change-me -X POST http://localhost:8080/api/v1/events \
   -d '{"tenantId":"acme","employeeId":"E-1001","type":"CREATE","version":1,"name":"Asha Rao","email":"asha@example.com","managerId":"M-10","officeCode":"BLR","phone":"+919876543210"}'
 ```
 
-Replay the same payload to verify idempotency (`IGNORED / DUPLICATE_VERSION`):
+Send the same request again to see the duplicate being ignored.
 
-```bash
-# Run the same curl request again.
-```
-
-Deactivate an employee (no profile fields are required):
+### Deactivate an employee
 
 ```bash
 curl -u operator:change-me -X POST http://localhost:8080/api/v1/events \
@@ -118,7 +152,7 @@ curl -u operator:change-me -X POST http://localhost:8080/api/v1/events \
   -d '{"tenantId":"acme","employeeId":"E-1001","type":"DEACTIVATE","version":2}'
 ```
 
-Update transport-owned fields:
+### Update transport details
 
 ```bash
 curl -u transport-admin:change-me -X PUT http://localhost:8080/api/v1/transport-profiles/E-1001 \
@@ -126,122 +160,65 @@ curl -u transport-admin:change-me -X PUT http://localhost:8080/api/v1/transport-
   -d '{"pickupPoint":"Indiranagar Metro","specialAssistance":false}'
 ```
 
-Preview a nightly CSV snapshot (returns 3-way estimates and stages diff):
+### Preview the nightly employee file
 
 ```bash
 curl -u operator:change-me -X POST http://localhost:8080/api/v1/reconciliation/preview \
   -H 'X-Tenant-Id: acme' -F 'file=@sample-data/employees.csv'
 ```
 
-Example preview response:
-```json
-{
-  "runId": "e6e0c55a-1d43-48cf-95f0-2897ad5ab91b",
-  "activeBefore": 7,
-  "snapshotRows": 7,
-  "estimatedMissing": 1,
-  "estimatedNew": 1,
-  "estimatedChanged": 1,
-  "missingRatio": 0.14285714285714285,
-  "safetyBrake": false,
-  "status": "READY_TO_APPLY",
-  "invalidRows": [],
-  "invalidRowsTruncated": 0
-}
-```
+The CSV needs these headers: `employeeId`, `name`, `email`, `managerId`, `officeCode`, and `phone`.
 
-The CSV must include headers (`employeeId`, `name`, `email`, `managerId`, `officeCode`, `phone`). The preview stages new, changed, and missing records in database staging tables, leaving live employee records untouched.
+The preview response includes the run ID and counts of new, changed and missing employees. Previewing does not modify live employee records.
 
-Approve a run if the safety brake was triggered (`missingRatio >= 0.30`):
+### Approve a run if the safety check is triggered
+
+Replace `<RUN_ID>` with the ID returned by the preview:
 
 ```bash
 curl -u operator:change-me -X POST http://localhost:8080/api/v1/reconciliation/<RUN_ID>/approve \
   -H 'X-Tenant-Id: acme'
 ```
 
-Apply a safe or approved run (applies deactivations, field updates, and insertions atomically with outbox events):
+### Apply the preview
 
 ```bash
 curl -u operator:change-me -X POST http://localhost:8080/api/v1/reconciliation/<RUN_ID>/apply \
   -H 'X-Tenant-Id: acme'
 ```
 
-Example apply response:
-```json
-{
-  "runId": "e6e0c55a-1d43-48cf-95f0-2897ad5ab91b",
-  "status": "APPLIED",
-  "deactivatedEmployees": 1,
-  "updatedEmployees": 1,
-  "createdEmployees": 1
-}
-```
+The response reports how many employees were created, updated and deactivated.
 
-## Tests and benchmarks
+## Tests and performance
+
+Run the automated tests:
 
 ```bash
 mvn clean test
 ```
 
-The test suite includes **52 automated tests** across 12 test classes covering stale/duplicate event handling, out-of-order versions, transport field preservation, deactivation semantics, RFC-4180 streaming CSV parsing, safety-brake threshold enforcement, concurrent apply row-locking, outbox publishing with `SKIP LOCKED`, and end-to-end reconciliation diffing.
+The latest verification report recorded **57 tests passed, with 0 failures, 0 errors and 0 skipped tests**. The application was also started with Docker Compose, and its health endpoint returned `UP`.
 
-### Automated Test Suite Overview
+The tests cover employee event ordering, duplicate updates, field ownership, validation, tenant access, CSV parsing, the safety check, concurrent apply requests and outbox retry behavior.
 
-| Test Class | Tests | Focus Area | Technology |
-|---|---|---|---|
-| `EmployeeEventApiTest` | 12 | Event ingestion API, validation, idempotency, auth | MockMvc + SpringBootTest |
-| `EmployeeSyncServiceTest` | 5 | Domain sync rules, field ownership, versioning | Unit / Mockito |
-| `EmployeeSyncConcurrencyTest` | 1 | Real concurrent database event updates | Testcontainers PostgreSQL |
-| `ThreeWayReconciliationTest` | 17 | New / changed / missing diffs, RFC-4180 parsing, apply safety | Unit / In-Memory Mock |
-| `CsvStreamParserTest` | 7 | Quoted fields, escaped quotes, multiline, CRLF, malformed rows | Unit |
-| `ReconciliationApplyConcurrencyTest` | 1 | Concurrent apply requests, row locking, status transitions | Testcontainers PostgreSQL |
-| `ReconciliationApprovalTest` | 2 | Safety-brake manual approval and validation | Unit |
-| `ReconciliationServiceTest` | 2 | Reconciliation service unit flow and status checks | Unit / Mockito |
-| `DeactivationBookingListenerTest` | 2 | Kafka deactivation listener, duplicate delivery safety | Unit / Mockito |
-| `OutboxRecoveryTest` | 1 | Polling outbox recovery and retry behavior | Unit / Mockito |
-| `Reconciliation200kBenchmarkTest` | 1 | Mocked repo streaming disk CSV diff (200k rows) | Benchmark |
-| `ReconciliationPostgresIntegrationBenchmarkTest` | 1 | Real PostgreSQL 16 streaming diff (5k DB + 5k CSV) | Testcontainers PostgreSQL |
+### Recorded performance checks
 
-### Benchmark Evidence
+- **200,000-row mock benchmark:** approximately 1.98–7.80 seconds. This checks the file-processing algorithm with mocked database access. It is not a full 200,000-row PostgreSQL end-to-end test.
+- **5,000-row PostgreSQL integration benchmark:** approximately 2.20–2.70 seconds in the recorded run. This uses a real PostgreSQL test container and checks the database comparison and staging flow.
 
-Actual execution measurements from this environment:
-- **Processor:** Intel(R) Core(TM) i5-10300H CPU @ 2.50GHz (4 Cores, 8 Logical Processors)
-- **RAM:** 8.00 GB
-- **Operating System:** Windows 10
-- **Java Runtime:** Eclipse Temurin OpenJDK 21.0.13+9 (64-Bit Server VM)
-- **Benchmark 1 — Mocked Repository & Streaming Disk CSV Diff (200,000 rows):** **1,980 ms – 2,317 ms**
-  - Measures pure CPU and disk I/O performance of the 256-bucket partitioning and diffing algorithm on 200,000 incoming CSV snapshot records vs 200,000 in-memory active employee records without database/network latency.
-- **Benchmark 2 — Real PostgreSQL Integration Benchmark (5,000 DB rows + 5,000 CSV rows):** **2,204 ms – 5,546 ms**
-  - Measures real end-to-end database performance using Testcontainers PostgreSQL 16: streaming DB projection query, 256-bucket disk partitioning, two-way diff computation, and batch staging inserts.
-- **Test Suite Results:** **52 tests run, 0 failures, 0 errors, 0 skipped** (`BUILD SUCCESS`).
+These results are measurements from the test environment, not a guarantee for every machine. The case study asks for a 200,000-row diff in under 60 seconds with bounded memory. The 200,000-row mock benchmark is useful evidence for the comparison algorithm, but a full 200,000-row database benchmark is still needed to claim that the complete database-backed flow meets that target.
 
-## Complexity
+## Design choices and limitations
 
-- **Event update:** Indexed employee lookup plus row lock (`FOR NO KEY UPDATE`) and atomic outbox insert; $O(1)$ expected work per event.
-- **Three-way snapshot reconciliation:**
-  - **Time complexity:** $O(N + M)$ where $N$ is incoming CSV rows and $M$ is active database rows. $O(N)$ streaming partitioning across 256 disk buckets, $O((N+M)/256)$ join per bucket, and batch staging inserts.
-  - **Heap memory:** Expected $O(N/256)$ under uniform hashing ($\approx 781$ records per bucket for $N = 200,000$, $\approx 150 \text{ KB}$ heap per bucket) as only one bucket partition is loaded into memory at a time. In the worst-case hash skew (all records hashing to a single bucket), memory degrades gracefully to $O(N)$.
-- **Outbox polling:** $O(P)$ work per poll for up to 100 pending events; indexed by `(published_at, created_at)` with `FOR UPDATE SKIP LOCKED` for safe multi-replica polling.
+- **Employee ordering:** Updates for one employee are protected using database locks and source versions. This favours correct ordering over allowing simultaneous writes to the same employee.
+- **Outgoing events:** Employee changes and their outgoing event records are committed together. Kafka delivery is at least once, so a receiving service must safely handle a repeated event ID.
+- **CSV memory use:** Disk buckets reduce the amount of data held in memory at one time. Expected memory use is lower when records are spread across buckets; an unusually uneven distribution can make one bucket large.
+- **Authentication:** Demo users are stored in memory and use HTTP Basic authentication. Production needs enterprise login and stronger access management.
+- **Outbox history:** Published event records are retained. A production system should add an archive or cleanup process.
+- **Failure testing:** The project tests retry and recovery behavior, but a full process-crash test between the database commit and Kafka publication would provide stronger evidence for the case-study failure requirement.
 
-## Production Considerations and Future Enhancements
+## Repository
 
-1. **Authentication and Authorization:** Replace demo in-memory Basic Auth accounts (`operator`) with an enterprise identity provider (OIDC/OAuth2/JWT) and fine-grained tenant membership RBAC for production deployment.
-2. **Infrastructure Failure-Injection:** Extend the outbox recovery test into a distributed network partition test (e.g. killing Kafka brokers mid-transaction) to verify failover resiliency.
-3. **Observability and Alerting:** Wire Micrometer / Prometheus metrics for reconciliation duration, bucket partition skew, outbox depth/age, and safety-brake trigger frequency.
-4. **Distributed Load Profiling:** Measure end-to-end event ingestion latency percentiles ($p50$/$p95$/$p99$) under high-throughput concurrent loads using Gatling or k6.
-5. **Data Archival:** Configure automated background cleanup or archival jobs for processed outbox records (`published_at IS NOT NULL`) and historical reconciliation runs.
+[GitHub – HR Roster Sync](https://github.com/swetak0911/hr-roster-sync)
 
-## Git repository and push
-
-Repository: [https://github.com/swetak0911/hr-roster-sync](https://github.com/swetak0911/hr-roster-sync)
-
-To verify git status, commit verified changes, and push updates to `main`:
-
-```bash
-git status
-git add .
-git commit -m "feat: complete two-way reconciliation, streaming RFC-4180 CSV parser, and atomic apply locking"
-git push origin main
-```
-
-Never commit `.env` or real employee data. After pushing, open the repository in a private/incognito browser window to confirm reviewers can access it.
+Do not commit the real `.env` file, passwords or real employee information.
