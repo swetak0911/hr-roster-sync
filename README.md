@@ -379,14 +379,20 @@ In the recorded 200,000-row PostgreSQL run:
 - [x] Automated test suite: 63 tests passed in the latest local run
 - [x] Recorded 200,000-row PostgreSQL benchmark below 60 seconds for preview
 - [x] Process-crash recovery test
-- [ ] Capture benchmark machine details and repeated measurements
-- [ ] Add p50/p99 and throughput-under-load results
-- [ ] Record the short end-to-end demo video
-- [ ] Attach the final 1-2 page design note and failure-mode table
+- [ ] Capture benchmark machine details and repeated measurements (see [benchmark runbook](docs/BENCHMARK-RUNBOOK.md))
+- [ ] Add statistically useful p50/p99 and throughput-under-load results (the runbook explains how to collect them)
+- [ ] Record the short end-to-end demo video (see [demo recording guide](docs/DEMO-RECORDING-GUIDE.md))
+- [x] Add design note, architecture/sequence diagrams, trade-offs and failure-mode table ([design note](docs/DESIGN.md))
 
 ---
 
-## 12. Repository and safety
+## 12. Assessment documents
+
+- [System design note](docs/DESIGN.md) - architecture, event sequence, reconciliation safety, failure modes and trade-offs.
+- [Benchmark runbook](docs/BENCHMARK-RUNBOOK.md) - host details, repeatable 200k benchmark, percentile calculation and results table.
+- [Demo recording guide](docs/DEMO-RECORDING-GUIDE.md) - timed walkthrough, narration and recording checklist.
+
+## 13. Repository and safety
 
 Repository: [swetak0911/hr-roster-sync](https://github.com/swetak0911/hr-roster-sync)
 
