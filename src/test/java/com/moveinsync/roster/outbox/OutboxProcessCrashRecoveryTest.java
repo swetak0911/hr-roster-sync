@@ -74,11 +74,11 @@ class OutboxProcessCrashRecoveryTest {
     void committedOutboxEventSurvivesRealProcessCrashAndPublishesAfterRestart() throws Exception {
         UUID eventId = UUID.randomUUID();
         String classpath = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
-        String java = Path.of(System.getProperty("java.home"), "bin",
+        String javaExecutable = Path.of(System.getProperty("java.home"), "bin",
                 System.getProperty("os.name").toLowerCase().contains("win") ? "java.exe" : "java").toString();
 
         Process child = new ProcessBuilder(
-                java, "-cp", classpath,
+                javaExecutable, "-cp", classpath,
                 OutboxCrashWriterProcess.class.getName(),
                 postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword(), eventId.toString())
                 .redirectErrorStream(true)
