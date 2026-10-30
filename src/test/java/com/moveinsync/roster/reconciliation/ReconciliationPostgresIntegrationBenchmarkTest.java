@@ -170,6 +170,7 @@ class ReconciliationPostgresIntegrationBenchmarkTest {
 
     @Test
     void liveEmployeeUpdateAfterPreviewMustAbortStaleReconciliationApply() throws Exception {
+        String raceTenant = "race-tenant-" + java.util.UUID.randomUUID();
         jdbc.update("""
                 INSERT INTO employees
                     (tenant_id, employee_id, name, email, manager_id, office_code,
@@ -186,7 +187,7 @@ class ReconciliationPostgresIntegrationBenchmarkTest {
 
         ReconciliationService.ReconciliationReport report;
         try (var input = Files.newInputStream(csv)) {
-            report = service.preview(TENANT, input);
+            report = service.preview(raceTenant, input);
         }
         assertEquals(1, report.estimatedChanged());
 
@@ -196,24 +197,24 @@ class ReconciliationPostgresIntegrationBenchmarkTest {
                 SET name='Live Event Name', email='live@example.com',
                     source_version=2, updated_at=now()
                 WHERE tenant_id=? AND employee_id=?
-                """, TENANT, "RACE-1");
+                """, raceTenant, "RACE-1");
 
         IllegalStateException conflict = assertThrows(IllegalStateException.class,
-                () -> service.apply(TENANT, report.runId()));
+                () -> service.apply(raceTenant, report.runId()));
         assertTrue(conflict.getMessage().contains("RECONCILIATION_VERSION_CONFLICT"),
                 "Expected optimistic version conflict but got: " + conflict.getMessage());
 
         assertEquals("Live Event Name", jdbc.queryForObject(
                 "SELECT name FROM employees WHERE tenant_id=? AND employee_id=?",
-                String.class, TENANT, "RACE-1"));
+                String.class, raceTenant, "RACE-1"));
         assertEquals(2L, jdbc.queryForObject(
                 "SELECT source_version FROM employees WHERE tenant_id=? AND employee_id=?",
-                Long.class, TENANT, "RACE-1"));
+                Long.class, raceTenant, "RACE-1"));
         assertEquals(0L, jdbc.queryForObject(
                 "SELECT count(*) FROM outbox_events WHERE tenant_id=? AND employee_id=?",
-                Long.class, TENANT, "RACE-1"));
+                Long.class, raceTenant, "RACE-1"));
         assertEquals("READY_TO_APPLY", jdbc.queryForObject(
                 "SELECT status FROM reconciliation_runs WHERE id=? AND tenant_id=?",
-                String.class, report.runId(), TENANT));
+                String.class, report.runId(), raceTenant));
     }
 }
