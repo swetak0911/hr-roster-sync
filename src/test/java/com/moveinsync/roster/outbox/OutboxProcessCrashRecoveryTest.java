@@ -8,6 +8,8 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.clients.producer.ProducerConfig;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
@@ -110,6 +112,9 @@ class OutboxProcessCrashRecoveryTest {
 
         // A fresh publisher instance represents the restarted application process.
         Map<String, Object> producerProperties = KafkaTestUtils.producerProps(embeddedKafka);
+        // KafkaTestUtils defaults the key serializer to IntegerSerializer; our publisher sends String keys.
+        producerProperties.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        producerProperties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
         var producerFactory = new DefaultKafkaProducerFactory<String, String>(producerProperties);
         KafkaTemplate<String, String> kafkaTemplate = new KafkaTemplate<>(producerFactory);
         OutboxMetrics metrics = new OutboxMetrics(outboxRepository, new SimpleMeterRegistry());
