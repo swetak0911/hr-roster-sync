@@ -176,7 +176,7 @@ class ReconciliationPostgresIntegrationBenchmarkTest {
                     (tenant_id, employee_id, name, email, manager_id, office_code,
                      phone, source_version, active, special_assistance, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE, FALSE, now())
-                """, TENANT, "RACE-1", "Original Name", "original@example.com",
+                """, raceTenant, "RACE-1", "Original Name", "original@example.com",
                 "MGR-1", "BLR", "+919876543210", 1L);
 
         Path csv = temp.resolve("race-snapshot.csv");
