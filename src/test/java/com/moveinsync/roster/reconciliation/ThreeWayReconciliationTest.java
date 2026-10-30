@@ -339,5 +339,79 @@ class ThreeWayReconciliationTest {
         assertEquals(1, result.created());
         verify(jdbc).update(contains("status='APPLIED'"), eq(runId), eq("acme"));
     }
+
+    // 14. Quoted fields containing commas and escaped quotes in CSV
+    @Test
+    void testQuotedFieldsAndEscapedQuotesInCsv() throws Exception {
+        when(repo.countByTenantIdAndActiveTrue("acme")).thenReturn(1L);
+        when(repo.streamAllForReconciliation("acme")).thenReturn(Stream.of(
+            new EmployeeSnapshotRecord("E1", "Asha Rao", "asha@example.com", "M1", "BLR", null, true)
+        ));
+
+        // E1 has changed name with quoted comma: "Rao, Asha"
+        // E2 is new with escaped double quotes: "Asha ""Rock"" Rao"
+        String csv = """
+            employeeId,name,email,managerId,officeCode,phone
+            E1,"Rao, Asha",asha@example.com,M1,BLR,+919876543210
+            E2,"Asha ""Rock"" Rao",rock@example.com,M1,BLR,+919876543211
+            """;
+
+        var report = service.preview("acme", new ByteArrayInputStream(csv.getBytes(StandardCharsets.UTF_8)));
+
+        assertEquals(1, report.estimatedChanged(), "E1 with comma in quotes should be recognized as changed");
+        assertEquals(1, report.estimatedNew(), "E2 with escaped quote should be recognized as new");
+        assertEquals(0, report.estimatedMissing());
+    }
+
+    // 15. Reordered headers and optional fields omitted
+    @Test
+    void testReorderedHeadersAndOptionalFields() throws Exception {
+        when(repo.countByTenantIdAndActiveTrue("acme")).thenReturn(1L);
+        when(repo.streamAllForReconciliation("acme")).thenReturn(Stream.of(
+            new EmployeeSnapshotRecord("E1", "Asha", "asha@example.com", "M1", "BLR", null, true)
+        ));
+
+        // Reordered: officeCode first, managerId and phone completely omitted
+        String csv = """
+            office_code,email,employee_id,name
+            HYD,asha@example.com,E1,Asha
+            BLR,new@example.com,E2,New Person
+            """;
+
+        var report = service.preview("acme", new ByteArrayInputStream(csv.getBytes(StandardCharsets.UTF_8)));
+
+        assertEquals(1, report.estimatedChanged(), "E1 should have office changed to HYD");
+        assertEquals(1, report.estimatedNew(), "E2 should be new");
+    }
+
+    // 16. Malformed row handling (e.g. unclosed quote)
+    @Test
+    void testMalformedRowHandling() throws Exception {
+        when(repo.countByTenantIdAndActiveTrue("acme")).thenReturn(1L);
+        when(repo.streamAllForReconciliation("acme")).thenReturn(Stream.of(
+            new EmployeeSnapshotRecord("E1", "Asha", "asha@example.com", "M1", "BLR", null, true)
+        ));
+
+        // Row 2 is malformed with an unclosed quote
+        String csv = "employeeId,name,email,managerId,officeCode,phone\n" +
+                     "E1,Asha,asha@example.com,M1,BLR,+919876543210\n" +
+                     "E2,\"Unclosed quote,email,M1,BLR,+919876543211";
+
+        var report = service.preview("acme", new ByteArrayInputStream(csv.getBytes(StandardCharsets.UTF_8)));
+
+        assertEquals(1, report.snapshotRows());
+        assertTrue(report.invalidRows().stream().anyMatch(r -> r.contains("malformed")));
+    }
+
+    // 17. Repeated apply on already APPLIED run throws IllegalStateException
+    @Test
+    void testRepeatedApplyRejected() {
+        UUID runId = UUID.randomUUID();
+        when(jdbc.queryForObject(anyString(), eq(String.class), eq(runId), eq("acme"))).thenReturn("APPLIED");
+
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () -> service.apply("acme", runId));
+        assertEquals("RUN_ALREADY_APPLIED", ex.getMessage());
+        verify(jdbc, never()).update(contains("WITH deactivated"), any(), any());
+    }
 }
 

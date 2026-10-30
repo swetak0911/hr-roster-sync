@@ -11,6 +11,17 @@ import java.util.stream.LongStream;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
+/**
+ * Mocked Repository & Streaming Disk CSV Diff Benchmark.
+ *
+ * Measures:
+ * 1. RFC-4180 compliant streaming CSV parsing of 200,000 rows.
+ * 2. Hash-partitioning across 256 temporary disk bucket files.
+ * 3. Bucket-by-bucket loading and hash join in bounded working memory.
+ *
+ * NOTE: This benchmark isolates the computational and streaming disk I/O algorithm.
+ * It uses a mocked repository and mocked JdbcTemplate, and does NOT measure real PostgreSQL network or transaction commit overhead.
+ */
 class Reconciliation200kBenchmarkTest {
     @TempDir Path temp;
     @Test void streamsTwoHundredThousandRowsWithinSixtySeconds() throws Exception {
@@ -31,7 +42,7 @@ class Reconciliation200kBenchmarkTest {
         ReconciliationService.ReconciliationReport report;
         try (var input = Files.newInputStream(csv)) { report = service.preview("bench", input); }
         long elapsedMs = (System.nanoTime() - started) / 1_000_000;
-        System.out.printf("200k reconciliation: %d ms; missing=%d; buckets=%d%n", elapsedMs, report.estimatedMissing(), 256);
+        System.out.printf("[Mocked Benchmark] 200k snapshot reconciliation: %d ms; missing=%d; buckets=%d%n", elapsedMs, report.estimatedMissing(), 256);
         assertEquals(0, report.estimatedMissing());
         assertEquals(0, report.estimatedNew());
         assertEquals(0, report.estimatedChanged());

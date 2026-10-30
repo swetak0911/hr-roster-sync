@@ -61,44 +61,65 @@ public class ReconciliationService {
             Path[] snapshotBuckets = createBuckets(work, "snapshot-");
             Path[] dbBuckets = createBuckets(work, "db-");
 
-            // Phase 1: Partition incoming snapshot CSV into 256 disk buckets
+            // Phase 1: Partition incoming snapshot CSV into 256 disk buckets via streaming RFC-4180 parser
             try (WriterGroup snapshotWriters = new WriterGroup(snapshotBuckets)) {
                 try (BufferedReader reader = new BufferedReader(new InputStreamReader(csv, StandardCharsets.UTF_8), 64 * 1024)) {
-                    String headerLine = reader.readLine();
-                    if (headerLine != null) {
-                        Map<String, Integer> colMap = parseHeaders(headerLine);
-                        int idIdx = colMap.getOrDefault("employeeid", 0);
-                        Integer nameIdx = colMap.get("name");
-                        if (nameIdx == null && colMap.containsKey("name")) nameIdx = 1;
-                        Integer emailIdx = colMap.get("email");
-                        Integer managerIdx = colMap.containsKey("managerid") ? colMap.get("managerid") : colMap.get("manager");
-                        Integer officeIdx = colMap.containsKey("officecode") ? colMap.get("officecode") : colMap.get("office");
-                        Integer phoneIdx = colMap.get("phone");
+                    final Map<String, Integer> colMap = new HashMap<>();
+                    final boolean[] headerParsed = new boolean[]{false};
+                    final int[] idIdx = new int[]{-1};
+                    final Integer[] nameIdx = new Integer[]{null};
+                    final Integer[] emailIdx = new Integer[]{null};
+                    final Integer[] managerIdx = new Integer[]{null};
+                    final Integer[] officeIdx = new Integer[]{null};
+                    final Integer[] phoneIdx = new Integer[]{null};
+                    final long[] snapshotRowsCounter = new long[]{0};
+                    final long[] invalidTruncated = new long[]{0};
 
-                        String line; long row = 1;
-                        while ((line = reader.readLine()) != null) {
-                            row++;
-                            if (line.isBlank()) continue;
-                            String[] parts = line.split(",", -1);
-                            if (idIdx >= parts.length) {
-                                if (invalidRows.size() < 100) invalidRows.add("row:" + row); else invalidRowsTruncated++;
-                                continue;
-                            }
-                            String id = parts[idIdx].trim();
-                            if (id.isBlank()) {
-                                if (invalidRows.size() < 100) invalidRows.add("row:" + row); else invalidRowsTruncated++;
-                                continue;
-                            }
-                            String name = (nameIdx != null && nameIdx < parts.length) ? parts[nameIdx].trim() : (parts.length > 1 ? parts[1].trim() : "");
-                            String email = (emailIdx != null && emailIdx < parts.length) ? parts[emailIdx].trim() : (parts.length > 2 ? parts[2].trim() : "");
-                            String manager = (managerIdx != null && managerIdx < parts.length) ? parts[managerIdx].trim() : (parts.length > 3 ? parts[3].trim() : "");
-                            String office = (officeIdx != null && officeIdx < parts.length) ? parts[officeIdx].trim() : (parts.length > 4 ? parts[4].trim() : "");
-                            String phone = (phoneIdx != null && phoneIdx < parts.length) ? parts[phoneIdx].trim() : (parts.length > 5 ? parts[5].trim() : "");
-
-                            snapshotWriters.writer(bucket(id)).write(encodeRow(id, name, email, manager, office, phone));
-                            snapshotRows++;
+                    CsvStreamParser.parse(reader, row -> {
+                        if (!headerParsed[0]) {
+                            headerParsed[0] = true;
+                            colMap.putAll(parseHeaders(row.fields()));
+                            idIdx[0] = colMap.getOrDefault("employeeid", -1);
+                            nameIdx[0] = colMap.get("name");
+                            emailIdx[0] = colMap.get("email");
+                            managerIdx[0] = colMap.containsKey("managerid") ? colMap.get("managerid") : colMap.get("manager");
+                            officeIdx[0] = colMap.containsKey("officecode") ? colMap.get("officecode") : colMap.get("office");
+                            phoneIdx[0] = colMap.get("phone");
+                            return;
                         }
-                    }
+
+                        if (row.malformed()) {
+                            if (invalidRows.size() < 100) invalidRows.add("malformed:row:" + row.rowNumber());
+                            else invalidTruncated[0]++;
+                            return;
+                        }
+
+                        List<String> fields = row.fields();
+                        if (idIdx[0] < 0 || idIdx[0] >= fields.size()) {
+                            if (invalidRows.size() < 100) invalidRows.add("row:" + row.rowNumber());
+                            else invalidTruncated[0]++;
+                            return;
+                        }
+
+                        String id = fields.get(idIdx[0]).trim();
+                        if (id.isBlank()) {
+                            if (invalidRows.size() < 100) invalidRows.add("row:" + row.rowNumber());
+                            else invalidTruncated[0]++;
+                            return;
+                        }
+
+                        String name = (nameIdx[0] != null && nameIdx[0] < fields.size()) ? fields.get(nameIdx[0]).trim() : "";
+                        String email = (emailIdx[0] != null && emailIdx[0] < fields.size()) ? fields.get(emailIdx[0]).trim() : "";
+                        String manager = (managerIdx[0] != null && managerIdx[0] < fields.size()) ? fields.get(managerIdx[0]).trim() : "";
+                        String office = (officeIdx[0] != null && officeIdx[0] < fields.size()) ? fields.get(officeIdx[0]).trim() : "";
+                        String phone = (phoneIdx[0] != null && phoneIdx[0] < fields.size()) ? fields.get(phoneIdx[0]).trim() : "";
+
+                        snapshotWriters.writer(bucket(id)).write(encodeRow(id, name, email, manager, office, phone));
+                        snapshotRowsCounter[0]++;
+                    });
+
+                    snapshotRows = snapshotRowsCounter[0];
+                    invalidRowsTruncated = invalidTruncated[0];
                 }
             }
 
@@ -232,18 +253,33 @@ public class ReconciliationService {
         if (updated != 1) throw new IllegalStateException("RUN_APPROVAL_CONFLICT");
     }
 
-    /** Applies only READY_TO_APPLY or explicitly APPROVED runs. Atomic across deactivations, updates, and inserts. */
+    /** Applies only READY_TO_APPLY or explicitly APPROVED runs. Atomic across deactivations, updates, and inserts. Concurrency-safe. */
     @Transactional
     @CacheEvict(cacheNames="employee-profile", allEntries=true)
     public ApplyResult apply(String tenant, UUID runId) {
-        String status = getRunStatus(tenant, runId);
-        if (!"READY_TO_APPLY".equals(status) && !"APPROVED".equals(status))
-            throw new IllegalStateException("RUN_REQUIRES_APPROVAL_OR_IS_NOT_APPLICABLE");
+        // Concurrency-safe row lock on the reconciliation run
+        String status;
+        try {
+            status = jdbc.queryForObject("select status from reconciliation_runs where id=? and tenant_id=? for update",
+                    String.class, runId, tenant);
+        } catch (org.springframework.dao.EmptyResultDataAccessException ex) {
+            throw new IllegalArgumentException("RECONCILIATION_RUN_NOT_FOUND");
+        }
 
-        // 1. Deactivate missing active employees
+        if ("APPLIED".equals(status)) {
+            throw new IllegalStateException("RUN_ALREADY_APPLIED");
+        }
+        if (!"READY_TO_APPLY".equals(status) && !"APPROVED".equals(status)) {
+            throw new IllegalStateException("RUN_REQUIRES_APPROVAL_OR_IS_NOT_APPLICABLE");
+        }
+
+        // Atomically claim the run by transitioning to APPLYING
+        jdbc.update("update reconciliation_runs set status='APPLYING' where id=? and tenant_id=?", runId, tenant);
+
+        // 1. Deactivate missing active employees (advancing source_version by 1)
         String deactSql = """
             WITH deactivated AS (
-              UPDATE employees e SET active=false, updated_at=now()
+              UPDATE employees e SET active=false, source_version=e.source_version + 1, updated_at=now()
               FROM reconciliation_missing m
               WHERE m.run_id=? AND m.tenant_id=? AND e.tenant_id=m.tenant_id
                 AND e.employee_id=m.employee_id AND e.active=true
@@ -259,7 +295,7 @@ public class ReconciliationService {
             """;
         int deactivated = jdbc.update(deactSql, runId, tenant);
 
-        // 2. Update changed employees (HR fields only, preserve transport fields, advance version)
+        // 2. Update changed employees (HR fields only, preserve transport fields, advance version by 1)
         String updateSql = """
             WITH updated_emps AS (
               UPDATE employees e
@@ -313,13 +349,16 @@ public class ReconciliationService {
         return !v1.equals(v2);
     }
 
-    private Map<String, Integer> parseHeaders(String headerLine) {
+    private Map<String, Integer> parseHeaders(List<String> fields) {
         Map<String, Integer> map = new HashMap<>();
-        String[] parts = headerLine.split(",");
-        for (int i = 0; i < parts.length; i++) {
-            map.put(parts[i].trim().toLowerCase().replace("_", ""), i);
+        for (int i = 0; i < fields.size(); i++) {
+            map.put(fields.get(i).trim().toLowerCase().replace("_", "").replace(" ", ""), i);
         }
         return map;
+    }
+
+    private Map<String, Integer> parseHeaders(String headerLine) {
+        return parseHeaders(List.of(headerLine.split(",")));
     }
 
     private String encodeRow(String... fields) {
