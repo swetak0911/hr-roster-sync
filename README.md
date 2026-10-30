@@ -1,8 +1,8 @@
-# HR Roster Sync – MoveInSync Case Study 5
+# HR Roster Sync â€“ MoveInSync Case Study 5
 
 ## About this project
 
-This project is my Java backend solution for **MoveInSync's Case Study 5: HR Roster Sync – Idempotent, Out-of-Order, Self-Healing**.
+This project is my Java backend solution for **MoveInSync's Case Study 5: HR Roster Sync â€“ Idempotent, Out-of-Order, Self-Healing**.
 
 MoveInSync receives employee information from corporate clients. That information can arrive more than once, arrive in the wrong order, contain invalid data, or come through an incomplete nightly file. Some details are managed by HR, while others are managed by the transport team.
 
@@ -197,17 +197,33 @@ Run the automated tests:
 mvn clean test
 ```
 
-The latest verification report recorded **57 tests passed, with 0 failures, 0 errors and 0 skipped tests**. The application was also started with Docker Compose, and its health endpoint returned `UP`.
+The test suite includes **60 automated tests** across 13 test classes covering stale/duplicate event handling, out-of-order versions, transport field preservation, deactivation semantics, RFC-4180 streaming CSV parsing across buffer boundaries, safe record-level handling of malformed rows, safety-brake threshold enforcement, concurrent apply and approval row-locking, outbox publishing with `SKIP LOCKED`, and end-to-end reconciliation diffing. All 60 tests pass with 0 failures, 0 errors, and 0 skipped. The application was also started with Docker Compose, and its health endpoint returned `UP`.
 
-The tests cover employee event ordering, duplicate updates, field ownership, validation, tenant access, CSV parsing, the safety check, concurrent apply requests and outbox retry behavior.
+### Automated Test Suite Overview
+
+| Test Class | Tests | Focus Area | Technology |
+|---|---|---|---|
+| `EmployeeEventApiTest` | 12 | Event ingestion API, validation, idempotency, auth | MockMvc + SpringBootTest |
+| `EmployeeSyncServiceTest` | 5 | Domain sync rules, field ownership, versioning | Unit / Mockito |
+| `EmployeeSyncConcurrencyTest` | 1 | Real concurrent database event updates | Testcontainers PostgreSQL |
+| `ThreeWayReconciliationTest` | 20 | 3-way diffs, RFC-4180, malformed deactivation prevention, DB failure handling | Unit / In-Memory Mock |
+| `CsvStreamParserTest` | 9 | Quoted fields, escaped quotes, multiline, CRLF, buffer boundaries | Unit |
+| `ReconciliationApplyConcurrencyTest` | 2 | Concurrent apply requests, approval race safety, row locking | Testcontainers PostgreSQL |
+| `ReconciliationApprovalTest` | 2 | Safety-brake manual approval and validation | Unit |
+| `ReconciliationServiceTest` | 2 | Reconciliation service unit flow and status checks | Unit / Mockito |
+| `DeactivationBookingListenerTest` | 2 | Kafka deactivation listener, duplicate delivery safety | Unit / Mockito |
+| `OutboxRecoveryTest` | 2 | Polling outbox recovery and retry after Kafka failure | Unit / Mockito |
+| `OutboxSkipLockedConcurrencyTest` | 1 | Multi-instance outbox polling with `SKIP LOCKED` | Testcontainers PostgreSQL |
+| `Reconciliation200kBenchmarkTest` | 1 | Mocked repo streaming disk CSV diff (200k rows) | Benchmark |
+| `ReconciliationPostgresIntegrationBenchmarkTest` | 1 | Real PostgreSQL 16 streaming diff & staging writes (5k DB + 5k CSV) | Testcontainers PostgreSQL |
 
 ### Recorded performance checks
 
-- **200,000-row mock benchmark:** approximately 1.98–7.80 seconds. This checks the file-processing algorithm with mocked database access. It is not a full 200,000-row PostgreSQL end-to-end test.
-- **5,000-row PostgreSQL integration benchmark:** approximately 2.20–2.70 seconds in the recorded run. This uses a real PostgreSQL test container and checks the database comparison and staging flow.
+- **200,000-row mock benchmark:** approximately 1.98-5.70 seconds. This checks the file-processing algorithm with mocked database access. It is not a full 200,000-row PostgreSQL end-to-end test.
+- **5,000-row PostgreSQL integration benchmark:** approximately 2.20-3.72 seconds in the recorded run. This uses a real PostgreSQL test container and checks the database comparison and staging flow.
+
 
 These results are measurements from the test environment, not a guarantee for every machine. The case study asks for a 200,000-row diff in under 60 seconds with bounded memory. The 200,000-row mock benchmark is useful evidence for the comparison algorithm, but a full 200,000-row database benchmark is still needed to claim that the complete database-backed flow meets that target.
-
 ## Design choices and limitations
 
 - **Employee ordering:** Updates for one employee are protected using database locks and source versions. This favours correct ordering over allowing simultaneous writes to the same employee.
@@ -221,4 +237,4 @@ These results are measurements from the test environment, not a guarantee for ev
 
 [GitHub – HR Roster Sync](https://github.com/swetak0911/hr-roster-sync)
 
-Do not commit the real `.env` file, passwords or real employee information.
+Do not commit the real .env file, passwords or real employee information.

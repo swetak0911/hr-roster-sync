@@ -86,5 +86,41 @@ class CsvStreamParserTest {
         assertEquals(2, rows.size());
         assertEquals(List.of("E-1", "Asha", "asha@example.com", "", "", "+919876543210"), rows.get(1).fields());
     }
+
+    @Test
+    void testBufferBoundaryCrossing() throws Exception {
+        // BUFFER_SIZE is 8192 in CsvStreamParser
+        StringBuilder sb = new StringBuilder();
+        sb.append("employeeId,name,email\n");
+        // Pad row 1 so that row 2 starts around index 8170
+        String pad = "x".repeat(8140);
+        sb.append("E-PAD,").append(pad).append(",pad@example.com\n");
+        // Row 2 begins right before 8192 boundary, containing quoted commas and escaped quotes spanning across 8192
+        sb.append("E-SPLIT,\"Spanning, \"\"Escaped\"\" Field Value across the 8192 buffer boundary\",split@example.com\n");
+
+        List<CsvStreamParser.ParsedRow> rows = new ArrayList<>();
+        CsvStreamParser.parse(new StringReader(sb.toString()), rows::add);
+
+        assertEquals(3, rows.size());
+        assertEquals(List.of("employeeId", "name", "email"), rows.get(0).fields());
+        assertEquals("E-PAD", rows.get(1).fields().get(0));
+        assertFalse(rows.get(1).malformed());
+
+        CsvStreamParser.ParsedRow splitRow = rows.get(2);
+        assertEquals("E-SPLIT", splitRow.fields().get(0));
+        assertEquals("Spanning, \"Escaped\" Field Value across the 8192 buffer boundary", splitRow.fields().get(1));
+        assertEquals("split@example.com", splitRow.fields().get(2));
+        assertFalse(splitRow.malformed());
+    }
+
+    @Test
+    void testMalformedQuoteInMiddleOfField() throws Exception {
+        String csv = "employeeId,name,email\nE-1,Asha \"Unclosed,asha@example.com\n";
+        List<CsvStreamParser.ParsedRow> rows = new ArrayList<>();
+        CsvStreamParser.parse(new StringReader(csv), rows::add);
+
+        assertEquals(2, rows.size());
+        assertTrue(rows.get(1).malformed());
+    }
 }
 

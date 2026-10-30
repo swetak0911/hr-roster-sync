@@ -117,6 +117,42 @@ class ReconciliationPostgresIntegrationBenchmarkTest {
         assertEquals(0.10, report.missingRatio(), 0.001);
         assertFalse(report.safetyBrake(), "10% is below 30% brake threshold");
         assertTrue(elapsedMs < 30_000, "Benchmark should finish comfortably under 30 seconds");
+
+        // Verify real staging writes directly in PostgreSQL database
+        Long stagedMissingCount = jdbc.queryForObject(
+                "SELECT count(*) FROM reconciliation_missing WHERE run_id=? AND tenant_id=?", Long.class, report.runId(), tenant);
+        assertEquals(500L, stagedMissingCount, "PostgreSQL reconciliation_missing must contain 500 staged records");
+
+        Long stagedNewCount = jdbc.queryForObject(
+                "SELECT count(*) FROM reconciliation_new WHERE run_id=? AND tenant_id=?", Long.class, report.runId(), tenant);
+        assertEquals(500L, stagedNewCount, "PostgreSQL reconciliation_new must contain 500 staged records");
+
+        Long stagedChangedCount = jdbc.queryForObject(
+                "SELECT count(*) FROM reconciliation_changed WHERE run_id=? AND tenant_id=?", Long.class, report.runId(), tenant);
+        assertEquals(0L, stagedChangedCount, "PostgreSQL reconciliation_changed must contain 0 staged records");
+
+        String runStatus = jdbc.queryForObject(
+                "SELECT status FROM reconciliation_runs WHERE id=? AND tenant_id=?", String.class, report.runId(), tenant);
+        assertEquals("READY_TO_APPLY", runStatus, "PostgreSQL reconciliation_runs status must be READY_TO_APPLY");
+
+        // Apply the benchmark run to verify real database mutations and outbox records
+        service.apply(tenant, report.runId());
+
+        String appliedStatus = jdbc.queryForObject(
+                "SELECT status FROM reconciliation_runs WHERE id=? AND tenant_id=?", String.class, report.runId(), tenant);
+        assertEquals("APPLIED", appliedStatus, "PostgreSQL reconciliation_runs status must be APPLIED");
+
+        Long postDeactivatedCount = jdbc.queryForObject(
+                "SELECT count(*) FROM employees WHERE tenant_id=? AND active=false", Long.class, tenant);
+        assertEquals(500L, postDeactivatedCount, "PostgreSQL must have 500 deactivated employees");
+
+        Long postTotalEmployees = jdbc.queryForObject(
+                "SELECT count(*) FROM employees WHERE tenant_id=?", Long.class, tenant);
+        assertEquals(5_500L, postTotalEmployees, "PostgreSQL total employees must be 5,500 (5,000 initial + 500 new)");
+
+        Long outboxCount = jdbc.queryForObject(
+                "SELECT count(*) FROM outbox_events WHERE tenant_id=?", Long.class, tenant);
+        assertEquals(1_000L, outboxCount, "PostgreSQL outbox_events must contain 1,000 events (500 deactivations + 500 creations)");
     }
 }
 

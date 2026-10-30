@@ -207,7 +207,7 @@ class ThreeWayReconciliationTest {
         assertTrue(report.safetyBrake()); // 33.3% >= 30%
     }
 
-    // 9. Duplicate IDs in the incoming CSV: duplicate rows flagged and deduplicated
+    // 9. Duplicate IDs in the incoming CSV: duplicate rows flagged and deduplicated with conflicting data
     @Test
     void testDuplicateIdsInCsv() throws Exception {
         when(repo.countByTenantIdAndActiveTrue("acme")).thenReturn(1L);
@@ -215,17 +215,21 @@ class ThreeWayReconciliationTest {
             new EmployeeSnapshotRecord("E1", "Asha", "asha@example.com", "M1", "BLR", null, true)
         ));
 
+        // E1 has conflicting data between duplicate rows; E2 is new and has duplicate rows
         String csv = """
             employeeId,name,email,managerId,officeCode,phone
-            E1,Asha,asha@example.com,M1,BLR,+919876543210
+            E1,Asha Conflicting 1,asha1@example.com,M1,BLR,+919876543210
+            E1,Asha Conflicting 2,asha2@example.com,M2,HYD,+919876543299
             E2,Ravi,ravi@example.com,M1,BLR,+919876543211
             E2,Ravi Duplicate,ravi@example.com,M1,BLR,+919876543211
             """;
 
         var report = service.preview("acme", new ByteArrayInputStream(csv.getBytes(StandardCharsets.UTF_8)));
 
+        assertEquals(1, report.estimatedChanged(), "E1 should be counted as changed");
         assertEquals(1, report.estimatedNew(), "Only 1 unique new employee E2 should be counted");
-        assertTrue(report.invalidRows().stream().anyMatch(s -> s.contains("duplicate:E2")));
+        assertTrue(report.invalidRows().stream().anyMatch(s -> s.contains("duplicate:E1")), "Conflicting duplicate E1 must be flagged in invalidRows");
+        assertTrue(report.invalidRows().stream().anyMatch(s -> s.contains("duplicate:E2")), "Duplicate E2 must be flagged in invalidRows");
     }
 
     // 10. Cross-tenant isolation
@@ -412,6 +416,87 @@ class ThreeWayReconciliationTest {
         IllegalStateException ex = assertThrows(IllegalStateException.class, () -> service.apply("acme", runId));
         assertEquals("RUN_ALREADY_APPLIED", ex.getMessage());
         verify(jdbc, never()).update(contains("WITH deactivated"), any(), any());
+    }
+
+    // 18. Regression: Malformed row for an existing active employee does NOT cause deactivation
+    @Test
+    void testMalformedRowCannotCauseExistingEmployeeDeactivation() throws Exception {
+        when(repo.countByTenantIdAndActiveTrue("acme")).thenReturn(2L);
+        when(repo.streamAllForReconciliation("acme")).thenReturn(Stream.of(
+            new EmployeeSnapshotRecord("E1", "Asha", "asha@example.com", "M1", "BLR", null, true),
+            new EmployeeSnapshotRecord("E2", "Ravi", "ravi@example.com", "M1", "BLR", null, true)
+        ));
+
+        // E1 has valid row; E2 has malformed quote in field
+        String csv = """
+            employeeId,name,email,managerId,officeCode,phone
+            E1,Asha,asha@example.com,M1,BLR,+919876543210
+            E2,"Ravi "Malformed Quote,ravi@example.com,M1,BLR,+919876543210
+            """;
+
+        var report = service.preview("acme", new ByteArrayInputStream(csv.getBytes(StandardCharsets.UTF_8)));
+
+        // Safe record-level handling: E2 is identified as present, so E2 is NOT missing and NOT deactivated!
+        assertEquals(0, report.estimatedMissing(), "E2 must NOT be classified as missing despite malformed row");
+        assertEquals(0, report.estimatedChanged(), "E2 must NOT be updated with malformed data");
+        assertEquals(0, report.estimatedNew());
+        assertFalse(report.safetyBrake());
+        assertTrue(report.invalidRows().stream().anyMatch(r -> r.contains("malformed")));
+        verify(jdbc, never()).batchUpdate(contains("reconciliation_missing"), anyList());
+    }
+
+    // 19. Unidentifiable malformed row with missing active DB employee fails preview and prevents deactivation
+    @Test
+    void testUnidentifiableMalformedRowFailsPreviewAndPreventsDeactivation() {
+        when(repo.countByTenantIdAndActiveTrue("acme")).thenReturn(2L);
+        when(repo.streamAllForReconciliation("acme")).thenReturn(Stream.of(
+            new EmployeeSnapshotRecord("E1", "Asha", "asha@example.com", "M1", "BLR", null, true),
+            new EmployeeSnapshotRecord("E2", "Ravi", "ravi@example.com", "M1", "BLR", null, true)
+        ));
+
+        // Row 2 is unidentifiable because employeeId is completely blank
+        String csv = """
+            employeeId,name,email,managerId,officeCode,phone
+            E1,Asha,asha@example.com,M1,BLR,+919876543210
+            ,"Corrupted line with no ID",corrupted@example.com,M1,BLR,+919876543210
+            """;
+
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+            service.preview("acme", new ByteArrayInputStream(csv.getBytes(StandardCharsets.UTF_8)))
+        );
+        assertTrue(ex.getMessage().contains("RECONCILIATION_SAFETY_VIOLATION"));
+
+        // Verify status was marked FAILED and staging cleared
+        verify(jdbc).update(contains("status='FAILED'"), any(), eq("acme"));
+        verify(jdbc).update(contains("delete from reconciliation_missing"), any(), eq("acme"));
+    }
+
+    // 20. Database streaming exception fails the run safely without applying changes or using fake fallback
+    @Test
+    void testDatabaseStreamingExceptionFailsRunWithoutApplyingChanges() {
+        when(repo.countByTenantIdAndActiveTrue("acme")).thenReturn(5L);
+        when(repo.streamAllForReconciliation("acme"))
+                .thenThrow(new org.springframework.dao.DataAccessResourceFailureException("PostgreSQL streaming cursor terminated"));
+
+        String csv = """
+            employeeId,name,email,managerId,officeCode,phone
+            E1,Asha,asha@example.com,M1,BLR,+919876543210
+            """;
+
+        assertThrows(RuntimeException.class, () ->
+            service.preview("acme", new ByteArrayInputStream(csv.getBytes(StandardCharsets.UTF_8)))
+        );
+
+        // Verify status was updated to FAILED in reconciliation_runs
+        verify(jdbc).update(contains("status='FAILED'"), any(), eq("acme"));
+
+        // Verify unsafe fallback streamActiveIds was NEVER called
+        verify(repo, never()).streamActiveIds(any());
+
+        // Verify no staging records were inserted
+        verify(jdbc, never()).batchUpdate(contains("reconciliation_missing"), anyList());
+        verify(jdbc, never()).batchUpdate(contains("reconciliation_changed"), anyList());
+        verify(jdbc, never()).batchUpdate(contains("reconciliation_new"), anyList());
     }
 }
 

@@ -148,4 +148,94 @@ class ReconciliationApplyConcurrencyTest {
             pool.shutdownNow();
         }
     }
+
+    @Test
+    void simultaneousApprovalAndApplySafety() throws Exception {
+        String tenant = "acme";
+        UUID runId = UUID.randomUUID();
+
+        // 1. Employee staged as missing
+        Employee emp = new Employee(tenant, "E-300", "Bhavna", "bhavna@example.com", "M-2", "DEL", "+919876543233", 1L);
+        employees.saveAndFlush(emp);
+
+        // 2. Reconciliation run created in AWAITING_APPROVAL (brake tripped)
+        jdbc.update("INSERT INTO reconciliation_runs(id, tenant_id, status, active_before, snapshot_rows, estimated_missing, missing_ratio, safety_brake, created_at) " +
+                    "VALUES (?, ?, 'AWAITING_APPROVAL', 2, 1, 1, 0.50, true, now())", runId, tenant);
+        jdbc.update("INSERT INTO reconciliation_missing(run_id, tenant_id, employee_id) VALUES (?, ?, ?)", runId, tenant, "E-300");
+
+        // 3. Confirm an unapproved run can NEVER be applied directly
+        IllegalStateException unapprovedEx = assertThrows(IllegalStateException.class, () -> service.apply(tenant, runId));
+        assertEquals("RUN_REQUIRES_APPROVAL_OR_IS_NOT_APPLICABLE", unapprovedEx.getMessage());
+        Employee unapprovedEmp = employees.findByTenantIdAndEmployeeId(tenant, "E-300").orElseThrow();
+        assertTrue(unapprovedEmp.isActive(), "Employee must not be deactivated for unapproved run");
+        assertEquals(1L, unapprovedEmp.getSourceVersion());
+
+        // 4. Test concurrent race between approve and apply
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicInteger approveOk = new AtomicInteger(0);
+        AtomicInteger applyOk = new AtomicInteger(0);
+        AtomicInteger applyBlocked = new AtomicInteger(0);
+
+        try {
+            Future<?> fApprove = pool.submit(() -> {
+                try {
+                    latch.await();
+                    service.approve(tenant, runId, "operator");
+                    approveOk.incrementAndGet();
+                } catch (Exception e) {
+                    throw new CompletionException(e);
+                }
+            });
+
+            Future<?> fApply = pool.submit(() -> {
+                try {
+                    latch.await();
+                    service.apply(tenant, runId);
+                    applyOk.incrementAndGet();
+                } catch (IllegalStateException e) {
+                    if ("RUN_REQUIRES_APPROVAL_OR_IS_NOT_APPLICABLE".equals(e.getMessage())) {
+                        applyBlocked.incrementAndGet();
+                    } else {
+                        throw new CompletionException(e);
+                    }
+                } catch (Exception e) {
+                    throw new CompletionException(e);
+                }
+            });
+
+            latch.countDown();
+            fApprove.get(20, TimeUnit.SECONDS);
+            fApply.get(20, TimeUnit.SECONDS);
+
+            assertEquals(1, approveOk.get(), "Approval must succeed");
+            if (applyBlocked.get() == 1) {
+                // Apply was safely rejected prior to approval; now apply after approval
+                service.apply(tenant, runId);
+            }
+
+            // 5. Run is now APPLIED. Verify approval can NEVER overwrite APPLIED or APPLYING
+            String finalStatus = jdbc.queryForObject("SELECT status FROM reconciliation_runs WHERE id=?", String.class, runId);
+            assertEquals("APPLIED", finalStatus);
+
+            IllegalStateException overwriteEx = assertThrows(IllegalStateException.class, () -> service.approve(tenant, runId, "operator"));
+            assertEquals("RUN_NOT_AWAITING_APPROVAL", overwriteEx.getMessage());
+
+            // Confirm status is STILL APPLIED in database (not overwritten)
+            String postStatus = jdbc.queryForObject("SELECT status FROM reconciliation_runs WHERE id=?", String.class, runId);
+            assertEquals("APPLIED", postStatus);
+
+            // 6. Test that approval cannot overwrite APPLYING state
+            UUID applyingRunId = UUID.randomUUID();
+            jdbc.update("INSERT INTO reconciliation_runs(id, tenant_id, status, active_before, snapshot_rows, estimated_missing, missing_ratio, safety_brake, created_at) " +
+                        "VALUES (?, ?, 'APPLYING', 1, 1, 0, 0.0, false, now())", applyingRunId, tenant);
+            IllegalStateException applyingOverwriteEx = assertThrows(IllegalStateException.class, () -> service.approve(tenant, applyingRunId, "operator"));
+            assertEquals("RUN_NOT_AWAITING_APPROVAL", applyingOverwriteEx.getMessage());
+            String stillApplying = jdbc.queryForObject("SELECT status FROM reconciliation_runs WHERE id=?", String.class, applyingRunId);
+            assertEquals("APPLYING", stillApplying);
+
+        } finally {
+            pool.shutdownNow();
+        }
+    }
 }

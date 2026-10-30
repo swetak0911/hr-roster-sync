@@ -22,7 +22,7 @@ public class ReconciliationService {
     private final double missingThreshold;
     private final JdbcTemplate jdbc;
 
-    public record SnapshotRow(String employeeId, String name, String email, String managerId, String officeCode, String phone) {}
+    public record SnapshotRow(String employeeId, String name, String email, String managerId, String officeCode, String phone, boolean valid) {}
     public record DbRow(String employeeId, String name, String email, String managerId, String officeCode, String phone, boolean active) {}
     public record ApplyResult(int deactivated, int updated, int created) {}
 
@@ -56,6 +56,7 @@ public class ReconciliationService {
         long missingCount = 0;
         long newCount = 0;
         long changedCount = 0;
+        long unidentifiableRows = 0;
 
         try {
             Path[] snapshotBuckets = createBuckets(work, "snapshot-");
@@ -74,6 +75,7 @@ public class ReconciliationService {
                     final Integer[] phoneIdx = new Integer[]{null};
                     final long[] snapshotRowsCounter = new long[]{0};
                     final long[] invalidTruncated = new long[]{0};
+                    final long[] unidentifiableRowsCounter = new long[]{0};
 
                     CsvStreamParser.parse(reader, row -> {
                         if (!headerParsed[0]) {
@@ -88,23 +90,32 @@ public class ReconciliationService {
                             return;
                         }
 
-                        if (row.malformed()) {
-                            if (invalidRows.size() < 100) invalidRows.add("malformed:row:" + row.rowNumber());
-                            else invalidTruncated[0]++;
-                            return;
+                        if (idIdx[0] < 0) {
+                            throw new IllegalArgumentException("CSV missing required header: employeeId");
                         }
 
                         List<String> fields = row.fields();
-                        if (idIdx[0] < 0 || idIdx[0] >= fields.size()) {
-                            if (invalidRows.size() < 100) invalidRows.add("row:" + row.rowNumber());
+                        String id = (idIdx[0] < fields.size()) ? fields.get(idIdx[0]).trim() : "";
+
+                        if (row.malformed()) {
+                            if (invalidRows.size() < 100) invalidRows.add("malformed:row:" + row.rowNumber());
                             else invalidTruncated[0]++;
+
+                            if (!id.isBlank()) {
+                                // Safe record-level handling: mark this employee as present in snapshot but invalid.
+                                // Guarantees an existing active employee on this row is NOT marked as missing and NOT deactivated,
+                                // while ensuring corrupted fields do not update the database.
+                                snapshotWriters.writer(bucket(id)).write(encodeRow(id, "", "", "", "", "", "false"));
+                            } else {
+                                unidentifiableRowsCounter[0]++;
+                            }
                             return;
                         }
 
-                        String id = fields.get(idIdx[0]).trim();
                         if (id.isBlank()) {
                             if (invalidRows.size() < 100) invalidRows.add("row:" + row.rowNumber());
                             else invalidTruncated[0]++;
+                            unidentifiableRowsCounter[0]++;
                             return;
                         }
 
@@ -114,30 +125,23 @@ public class ReconciliationService {
                         String office = (officeIdx[0] != null && officeIdx[0] < fields.size()) ? fields.get(officeIdx[0]).trim() : "";
                         String phone = (phoneIdx[0] != null && phoneIdx[0] < fields.size()) ? fields.get(phoneIdx[0]).trim() : "";
 
-                        snapshotWriters.writer(bucket(id)).write(encodeRow(id, name, email, manager, office, phone));
+                        snapshotWriters.writer(bucket(id)).write(encodeRow(id, name, email, manager, office, phone, "true"));
                         snapshotRowsCounter[0]++;
                     });
 
                     snapshotRows = snapshotRowsCounter[0];
                     invalidRowsTruncated = invalidTruncated[0];
+                    unidentifiableRows = unidentifiableRowsCounter[0];
                 }
             }
 
             // Phase 2: Partition DB records into 256 disk buckets
             try (WriterGroup dbWriters = new WriterGroup(dbBuckets)) {
-                Stream<EmployeeSnapshotRecord> tempStream = null;
-                try {
-                    tempStream = employees.streamAllForReconciliation(tenant);
-                } catch (Exception ignored) { }
-                final Stream<EmployeeSnapshotRecord> finalDbStream;
-                if (tempStream == null) {
-                    Stream<String> idStream = employees.streamActiveIds(tenant);
-                    finalDbStream = idStream != null ? idStream.map(id -> new EmployeeSnapshotRecord(id, "Name", "email@example.com", "M1", "BLR", null, true)) : Stream.empty();
-                } else {
-                    finalDbStream = tempStream;
-                }
-                try (finalDbStream) {
-                    finalDbStream.forEach(rec -> {
+                try (Stream<EmployeeSnapshotRecord> dbStream = employees.streamAllForReconciliation(tenant)) {
+                    if (dbStream == null) {
+                        throw new IllegalStateException("DATABASE_STREAM_UNAVAILABLE");
+                    }
+                    dbStream.forEach(rec -> {
                         try {
                             dbWriters.writer(bucket(rec.employeeId())).write(
                                 encodeRow(rec.employeeId(), rec.name(), rec.email(), rec.managerId(), rec.officeCode(), rec.phone(), String.valueOf(rec.active()))
@@ -184,8 +188,8 @@ public class ReconciliationService {
                                 missingBatch.add(new Object[]{runId, tenant, db.employeeId()});
                                 if (missingBatch.size() >= DB_BATCH_SIZE) flushMissing(missingBatch);
                             }
-                        } else {
-                            // In both snapshot and DB -> check if HR fields differ
+                        } else if (snap.valid()) {
+                            // In both snapshot and DB and row is valid -> check if HR fields differ
                             boolean changed = isDifferent(snap.name(), db.name())
                                     || isDifferent(snap.email(), db.email())
                                     || isDifferent(snap.managerId(), db.managerId())
@@ -207,16 +211,26 @@ public class ReconciliationService {
 
                 // Remaining entries in snapshotMap are in snapshot, absent in DB -> NEW EMPLOYEES
                 if (!snapshotMap.isEmpty()) {
-                    newCount += snapshotMap.size();
                     for (SnapshotRow snap : snapshotMap.values()) {
-                        newBatch.add(new Object[]{
-                            runId, tenant, snap.employeeId(),
-                            snap.name(), snap.email(), snap.managerId(), snap.officeCode(), snap.phone()
-                        });
-                        if (newBatch.size() >= DB_BATCH_SIZE) flushNew(newBatch);
+                        if (snap.valid()) {
+                            newCount++;
+                            newBatch.add(new Object[]{
+                                runId, tenant, snap.employeeId(),
+                                snap.name(), snap.email(), snap.managerId(), snap.officeCode(), snap.phone()
+                            });
+                            if (newBatch.size() >= DB_BATCH_SIZE) flushNew(newBatch);
+                        }
                     }
                     snapshotMap.clear();
                 }
+            }
+
+            // Safety validation: If the snapshot contained unidentifiable rows (rows with missing or blank employeeId)
+            // AND there are active DB employees classified as missing, safe reconciliation cannot be guaranteed
+            // because one of those missing employees could have been on the unidentifiable row.
+            if (unidentifiableRows > 0 && missingCount > 0) {
+                throw new IllegalStateException("RECONCILIATION_SAFETY_VIOLATION: Snapshot contains " + unidentifiableRows +
+                        " unidentifiable rows with missing employee IDs; cannot safely guarantee deactivations");
             }
 
             flushMissing(missingBatch);
@@ -234,9 +248,14 @@ public class ReconciliationService {
                     brake ? "SAFETY_BRAKE_APPROVAL_REQUIRED" : "READY_TO_APPLY",
                     invalidRows, invalidRowsTruncated, newCount, changedCount);
 
-        } catch (IOException | RuntimeException ex) {
+        } catch (Exception ex) {
+            jdbc.update("delete from reconciliation_missing where run_id=? and tenant_id=?", runId, tenant);
+            jdbc.update("delete from reconciliation_changed where run_id=? and tenant_id=?", runId, tenant);
+            jdbc.update("delete from reconciliation_new where run_id=? and tenant_id=?", runId, tenant);
             jdbc.update("update reconciliation_runs set status='FAILED' where id=? and tenant_id=?", runId, tenant);
-            throw ex;
+            if (ex instanceof IOException io) throw io;
+            if (ex instanceof RuntimeException rt) throw rt;
+            throw new RuntimeException("Reconciliation preview failed", ex);
         } finally {
             try (var paths = Files.walk(work)) {
                 paths.sorted(Comparator.reverseOrder()).forEach(path -> { try { Files.deleteIfExists(path); } catch (IOException ignored) { } });
@@ -246,7 +265,13 @@ public class ReconciliationService {
 
     @Transactional
     public void approve(String tenant, UUID runId, String approvedBy) {
-        String status = getRunStatus(tenant, runId);
+        String status;
+        try {
+            status = jdbc.queryForObject("select status from reconciliation_runs where id=? and tenant_id=? for update",
+                    String.class, runId, tenant);
+        } catch (org.springframework.dao.EmptyResultDataAccessException ex) {
+            throw new IllegalArgumentException("RECONCILIATION_RUN_NOT_FOUND");
+        }
         if (!"AWAITING_APPROVAL".equals(status)) throw new IllegalStateException("RUN_NOT_AWAITING_APPROVAL");
         int updated = jdbc.update("update reconciliation_runs set status='APPROVED',approved_by=?,approved_at=now() where id=? and tenant_id=? and status='AWAITING_APPROVAL'",
                 approvedBy, runId, tenant);
@@ -389,7 +414,8 @@ public class ReconciliationService {
         String manager = tokens.length > 3 ? decodeField(tokens[3]) : "";
         String office = tokens.length > 4 ? decodeField(tokens[4]) : "";
         String phone = tokens.length > 5 ? decodeField(tokens[5]) : "";
-        return new SnapshotRow(id, name, email, manager, office, phone);
+        boolean valid = tokens.length <= 6 || Boolean.parseBoolean(tokens[6]);
+        return new SnapshotRow(id, name, email, manager, office, phone, valid);
     }
 
     private DbRow parseDbRow(String line) {
