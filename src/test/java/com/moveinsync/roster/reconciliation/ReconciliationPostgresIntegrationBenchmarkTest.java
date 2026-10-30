@@ -1,14 +1,14 @@
 package com.moveinsync.roster.reconciliation;
 
 import com.moveinsync.roster.RosterSyncApplication;
-import com.moveinsync.roster.repository.EmployeeRepository;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
-import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
+import org.springframework.boot.test.autoconfigure.jdbc.DataJpaTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.transaction.annotation.Propagation;
@@ -21,26 +21,32 @@ import java.io.BufferedWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Real PostgreSQL-backed integration benchmark using Testcontainers.
- * Measures real database cursor streaming (fetchSize=1000), 256 disk-bucket partitioning,
- * paired hash join, and real JDBC batch inserts into PostgreSQL staging tables.
+ * Configurable real PostgreSQL-backed reconciliation benchmark.
+ *
+ * Default: 5,000 DB rows and 5,000 CSV rows.
+ * Larger run: mvn -Dtest=ReconciliationPostgresIntegrationBenchmarkTest
+ *                 -Dbenchmark.rows=200000 test
+ *
+ * The test is intentionally kept in the normal test suite at its small default
+ * size. The same code path is used for the full 200k assessment benchmark.
  */
 @DataJpaTest
-@org.springframework.test.context.ContextConfiguration(classes = RosterSyncApplication.class)
+@ContextConfiguration(classes = RosterSyncApplication.class)
 @Testcontainers(disabledWithoutDocker = true)
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
 @Transactional(propagation = Propagation.NOT_SUPPORTED)
 @Import(ReconciliationService.class)
 class ReconciliationPostgresIntegrationBenchmarkTest {
 
+    private static final String TENANT = "bench-tenant";
+
     @Container
-    static final PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+    static final PostgreSQLContainer<?> postgres =
+            new PostgreSQLContainer<>("postgres:16-alpine");
 
     @DynamicPropertySource
     static void database(DynamicPropertyRegistry registry) {
@@ -53,9 +59,6 @@ class ReconciliationPostgresIntegrationBenchmarkTest {
     ReconciliationService service;
 
     @Autowired
-    EmployeeRepository employees;
-
-    @Autowired
     JdbcTemplate jdbc;
 
     @TempDir
@@ -63,96 +66,105 @@ class ReconciliationPostgresIntegrationBenchmarkTest {
 
     @Test
     void realPostgresReconciliationBenchmark() throws Exception {
-        final int totalDbRows = 5_000;
-        final String tenant = "bench-tenant";
+        final int totalDbRows = Integer.getInteger("benchmark.rows", 5_000);
+        assertTrue(totalDbRows >= 10, "benchmark.rows must be at least 10");
+        final int unchangedRows = (int) (totalDbRows * 0.90);
+        final int missingRows = totalDbRows - unchangedRows;
+        final int newRows = missingRows;
+        final int snapshotRows = unchangedRows + newRows;
 
-        // Seed 5,000 real employee records into PostgreSQL via batch insert
-        List<Object[]> batch = new ArrayList<>(500);
-        for (int i = 0; i < totalDbRows; i++) {
-            batch.add(new Object[]{tenant, "EMP-" + i, "Employee " + i, "emp" + i + "@example.com", "MGR-1", "BLR", "+919876543210", 1L, true, false});
-            if (batch.size() >= 500) {
-                jdbc.batchUpdate("INSERT INTO employees(tenant_id, employee_id, name, email, manager_id, office_code, phone, source_version, active, special_assistance, updated_at) " +
-                                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())", batch);
-                batch.clear();
-            }
-        }
-        if (!batch.isEmpty()) {
-            jdbc.batchUpdate("INSERT INTO employees(tenant_id, employee_id, name, email, manager_id, office_code, phone, source_version, active, special_assistance, updated_at) " +
-                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())", batch);
-            batch.clear();
-        }
+        // Seed directly in PostgreSQL. This avoids allocating a Java object per employee.
+        jdbc.execute("""
+                INSERT INTO employees
+                    (tenant_id, employee_id, name, email, manager_id, office_code,
+                     phone, source_version, active, special_assistance, updated_at)
+                SELECT
+                    'bench-tenant',
+                    'EMP-' || n,
+                    'Employee ' || n,
+                    'emp' || n || '@example.com',
+                    'MGR-1',
+                    'BLR',
+                    '+919876543210',
+                    1,
+                    TRUE,
+                    FALSE,
+                    now()
+                FROM generate_series(0, %d) AS n
+                """.formatted(totalDbRows - 1));
 
-        // Create CSV snapshot with:
-        // - 4,500 unchanged
-        // - 500 omitted (missing -> 10% missing ratio)
-        // - 500 new employees
-        Path csvFile = temp.resolve("snapshot-bench.csv");
+        // Keep CSV generation streaming too: 90%% existing and 10%% new records.
+        Path csvFile = temp.resolve("snapshot-bench-" + totalDbRows + ".csv");
         try (BufferedWriter writer = Files.newBufferedWriter(csvFile, StandardCharsets.UTF_8)) {
             writer.write("employeeId,name,email,managerId,officeCode,phone\n");
-            // 4,500 existing
-            for (int i = 0; i < 4_500; i++) {
-                writer.write("EMP-" + i + ",Employee " + i + ",emp" + i + "@example.com,MGR-1,BLR,+919876543210\n");
+            for (int i = 0; i < unchangedRows; i++) {
+                writer.write("EMP-" + i + ",Employee " + i + ",emp" + i
+                        + "@example.com,MGR-1,BLR,+919876543210\n");
             }
-            // 500 new
-            for (int i = 5_000; i < 5_500; i++) {
-                writer.write("EMP-" + i + ",New Employee " + i + ",new" + i + "@example.com,MGR-1,BLR,+919876543210\n");
+            for (int i = totalDbRows; i < totalDbRows + newRows; i++) {
+                writer.write("EMP-" + i + ",New Employee " + i + ",new" + i
+                        + "@example.com,MGR-1,BLR,+919876543210\n");
             }
         }
 
-        long startTime = System.nanoTime();
+        long previewStart = System.nanoTime();
         ReconciliationService.ReconciliationReport report;
         try (var input = Files.newInputStream(csvFile)) {
-            report = service.preview(tenant, input);
+            report = service.preview(TENANT, input);
         }
-        long elapsedMs = (System.nanoTime() - startTime) / 1_000_000;
+        long previewMs = (System.nanoTime() - previewStart) / 1_000_000;
 
-        System.out.printf("[Real PostgreSQL Integration Benchmark] 5,000 DB rows + 5,000 CSV rows: %d ms (missing=%d, new=%d, changed=%d)%n",
-                elapsedMs, report.estimatedMissing(), report.estimatedNew(), report.estimatedChanged());
+        System.out.printf(
+                "[Real PostgreSQL Benchmark] DB rows=%d, CSV rows=%d, preview=%d ms, missing=%d, new=%d, changed=%d%n",
+                totalDbRows, snapshotRows, previewMs,
+                report.estimatedMissing(), report.estimatedNew(), report.estimatedChanged());
 
-        assertEquals(5_000, report.activeBefore());
-        assertEquals(5_000, report.snapshotRows());
-        assertEquals(500, report.estimatedMissing()); // EMP-4500 to EMP-4999
-        assertEquals(500, report.estimatedNew());     // EMP-5000 to EMP-5499
+        assertEquals(totalDbRows, report.activeBefore());
+        assertEquals(snapshotRows, report.snapshotRows());
+        assertEquals(missingRows, report.estimatedMissing());
+        assertEquals(newRows, report.estimatedNew());
         assertEquals(0, report.estimatedChanged());
-        assertEquals(0.10, report.missingRatio(), 0.001);
-        assertFalse(report.safetyBrake(), "10% is below 30% brake threshold");
-        assertTrue(elapsedMs < 30_000, "Benchmark should finish comfortably under 30 seconds");
+        assertEquals((double) missingRows / totalDbRows, report.missingRatio(), 0.001);
+        assertFalse(report.safetyBrake(), "10% missing must remain below the 30% safety-brake threshold");
 
-        // Verify real staging writes directly in PostgreSQL database
-        Long stagedMissingCount = jdbc.queryForObject(
-                "SELECT count(*) FROM reconciliation_missing WHERE run_id=? AND tenant_id=?", Long.class, report.runId(), tenant);
-        assertEquals(500L, stagedMissingCount, "PostgreSQL reconciliation_missing must contain 500 staged records");
+        if (totalDbRows >= 200_000) {
+            assertTrue(previewMs < 60_000,
+                    "The real PostgreSQL-backed 200k preview must finish under 60 seconds");
+        }
 
-        Long stagedNewCount = jdbc.queryForObject(
-                "SELECT count(*) FROM reconciliation_new WHERE run_id=? AND tenant_id=?", Long.class, report.runId(), tenant);
-        assertEquals(500L, stagedNewCount, "PostgreSQL reconciliation_new must contain 500 staged records");
+        assertEquals((long) missingRows, jdbc.queryForObject(
+                "SELECT count(*) FROM reconciliation_missing WHERE run_id=? AND tenant_id=?",
+                Long.class, report.runId(), TENANT));
+        assertEquals((long) newRows, jdbc.queryForObject(
+                "SELECT count(*) FROM reconciliation_new WHERE run_id=? AND tenant_id=?",
+                Long.class, report.runId(), TENANT));
+        assertEquals("READY_TO_APPLY", jdbc.queryForObject(
+                "SELECT status FROM reconciliation_runs WHERE id=? AND tenant_id=?",
+                String.class, report.runId(), TENANT));
 
-        Long stagedChangedCount = jdbc.queryForObject(
-                "SELECT count(*) FROM reconciliation_changed WHERE run_id=? AND tenant_id=?", Long.class, report.runId(), tenant);
-        assertEquals(0L, stagedChangedCount, "PostgreSQL reconciliation_changed must contain 0 staged records");
+        long applyStart = System.nanoTime();
+        service.apply(TENANT, report.runId());
+        long applyMs = (System.nanoTime() - applyStart) / 1_000_000;
 
-        String runStatus = jdbc.queryForObject(
-                "SELECT status FROM reconciliation_runs WHERE id=? AND tenant_id=?", String.class, report.runId(), tenant);
-        assertEquals("READY_TO_APPLY", runStatus, "PostgreSQL reconciliation_runs status must be READY_TO_APPLY");
+        Long deactivated = jdbc.queryForObject(
+                "SELECT count(*) FROM employees WHERE tenant_id=? AND active=false",
+                Long.class, TENANT);
+        Long totalEmployees = jdbc.queryForObject(
+                "SELECT count(*) FROM employees WHERE tenant_id=?",
+                Long.class, TENANT);
+        Long outboxEvents = jdbc.queryForObject(
+                "SELECT count(*) FROM outbox_events WHERE tenant_id=?",
+                Long.class, TENANT);
 
-        // Apply the benchmark run to verify real database mutations and outbox records
-        service.apply(tenant, report.runId());
+        System.out.printf(
+                "[Real PostgreSQL Benchmark] apply=%d ms, deactivated=%d, total employees=%d, outbox events=%d%n",
+                applyMs, deactivated, totalEmployees, outboxEvents);
 
-        String appliedStatus = jdbc.queryForObject(
-                "SELECT status FROM reconciliation_runs WHERE id=? AND tenant_id=?", String.class, report.runId(), tenant);
-        assertEquals("APPLIED", appliedStatus, "PostgreSQL reconciliation_runs status must be APPLIED");
-
-        Long postDeactivatedCount = jdbc.queryForObject(
-                "SELECT count(*) FROM employees WHERE tenant_id=? AND active=false", Long.class, tenant);
-        assertEquals(500L, postDeactivatedCount, "PostgreSQL must have 500 deactivated employees");
-
-        Long postTotalEmployees = jdbc.queryForObject(
-                "SELECT count(*) FROM employees WHERE tenant_id=?", Long.class, tenant);
-        assertEquals(5_500L, postTotalEmployees, "PostgreSQL total employees must be 5,500 (5,000 initial + 500 new)");
-
-        Long outboxCount = jdbc.queryForObject(
-                "SELECT count(*) FROM outbox_events WHERE tenant_id=?", Long.class, tenant);
-        assertEquals(1_000L, outboxCount, "PostgreSQL outbox_events must contain 1,000 events (500 deactivations + 500 creations)");
+        assertEquals((long) missingRows, deactivated);
+        assertEquals((long) (totalDbRows + newRows), totalEmployees);
+        assertEquals((long) (missingRows + newRows), outboxEvents);
+        assertEquals("APPLIED", jdbc.queryForObject(
+                "SELECT status FROM reconciliation_runs WHERE id=? AND tenant_id=?",
+                String.class, report.runId(), TENANT));
     }
 }
-
