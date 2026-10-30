@@ -141,7 +141,6 @@ class OutboxProcessCrashRecoveryTest {
             assertNotNull(delivered, "Restarted publisher must deliver the committed event to Kafka");
             assertEquals("crash-tenant:CRASH-EMP-1", delivered.key());
         } finally {
-            kafkaTemplate.destroy();
             producerFactory.destroy();
         }
 
