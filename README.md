@@ -366,27 +366,7 @@ In the recorded 200,000-row PostgreSQL run:
 
 ---
 
-## 11. Assessment evidence checklist
-
-- [x] Employee event ingestion and per-record validation
-- [x] Duplicate/stale/out-of-order event handling
-- [x] HR and transport field ownership
-- [x] Nightly CSV preview and three-way reconciliation
-- [x] 30% safety brake and operator approval
-- [x] Transactional outbox and Kafka publisher
-- [x] Deactivation booking-cancellation consumer
-- [x] Tenant/role checks and Redis cache
-- [x] Automated test suite: 63 tests passed in the latest local run
-- [x] Recorded 200,000-row PostgreSQL benchmark below 60 seconds for preview
-- [x] Process-crash recovery test
-- [ ] Capture benchmark machine details and repeated measurements
-- [ ] Add p50/p99 and throughput-under-load results
-- [ ] Record the short end-to-end demo video
-- [x] Add design note, architecture/sequence diagrams, trade-offs and failure-mode table ([design note](docs/DESIGN.md))
-
----
-
-## 12. Repository and safety
+## 11. Repository and safety
 
 Repository: [swetak0911/hr-roster-sync](https://github.com/swetak0911/hr-roster-sync)
 
