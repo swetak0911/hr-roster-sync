@@ -77,6 +77,7 @@ The deactivation consumer cancels future confirmed cab bookings and releases res
 
 ~~~mermaid
 sequenceDiagram
+    autonumber
     participant HR as HR system
     participant API as Spring Boot API
     participant DB as PostgreSQL
@@ -84,22 +85,27 @@ sequenceDiagram
     participant K as Kafka
     participant B as Booking consumer
 
-    HR->>API: Employee event with source version
-    API->>DB: Lock and check employee version
+    HR->>API: Send employee event with source version
+    API->>DB: Lock employee and check version
 
     alt Duplicate or stale event
-        API-->>HR: Return no-op result
+        API-->>HR: Return no-op response
     else Newer valid event
         API->>DB: Update employee and insert outbox row
         DB-->>API: Commit transaction
         API-->>HR: Return accepted
 
+        Note over P,DB: Publisher processes committed outbox rows asynchronously
         P->>DB: Claim pending row using SKIP LOCKED
         P->>K: Publish event ID and payload
-        K-->>B: Deliver deactivation event
-        B->>B: Cancel future confirmed rides
-        B->>B: Release reserved seats
+        K-->>P: Broker acknowledges publish
         P->>DB: Mark event as published
+        K-->>B: Deliver employee-change event
+
+        opt Employee deactivation event
+            B->>B: Cancel future confirmed bookings
+            B->>B: Release reserved seats
+        end
     end
 ~~~
 
@@ -149,7 +155,6 @@ The automated suite includes a process-crash recovery test: a child JVM commits 
 
 ## 9. Known limitations and production hardening
 
-- Disk-bucket skew means strict worst-case bounded memory is not yet proven.
 - p50/p99 latency and throughput-under-load results have not yet been collected.
 - Assessment authentication uses in-memory HTTP Basic demo accounts; production should use OIDC/OAuth2/JWT and persistent role/tenant administration.
 - Published outbox rows are retained; production needs archive/retention management.
