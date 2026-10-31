@@ -28,7 +28,6 @@ flowchart LR
   LISTENER --> BOOKINGS[Cancel future bookings / free seats]
   API <--> REDIS[(Redis profile cache)]
   TRANSPORT[Transport admin] --> API
-
 ~~~
 
 - **Spring Boot API:** event ingestion, transport-profile updates, employee reads and reconciliation.
@@ -78,27 +77,30 @@ The deactivation consumer cancels future confirmed cab bookings and releases res
 
 ~~~mermaid
 sequenceDiagram
-  participant HR as HR system
-  participant API as Spring Boot API
-  participant DB as PostgreSQL
-  participant P as Outbox publisher
-  participant K as Kafka
-  participant B as Booking consumer
-  HR->>API: Employee event (source version)
-  API->>DB: Lock/check employee version
-  alt Duplicate or stale
-    API-->>HR: No-op result
-  else Newer valid event
-    API->>DB: Update employee + insert outbox row
-    DB-->>API: Commit transaction
-    API-->>HR: Accepted
-    P->>DB: Claim pending row (SKIP LOCKED)
-    P->>K: Publish event ID + payload
-    K-->>B: Deactivation event
-    B->>B: Cancel future confirmed rides; release seats
-    P->>DB: Mark event published
-  end
+    participant HR as HR system
+    participant API as Spring Boot API
+    participant DB as PostgreSQL
+    participant P as Outbox publisher
+    participant K as Kafka
+    participant B as Booking consumer
 
+    HR->>API: Employee event with source version
+    API->>DB: Lock and check employee version
+
+    alt Duplicate or stale event
+        API-->>HR: Return no-op result
+    else Newer valid event
+        API->>DB: Update employee and insert outbox row
+        DB-->>API: Commit transaction
+        API-->>HR: Return accepted
+
+        P->>DB: Claim pending row using SKIP LOCKED
+        P->>K: Publish event ID and payload
+        K-->>B: Deliver deactivation event
+        B->>B: Cancel future confirmed rides
+        B->>B: Release reserved seats
+        P->>DB: Mark event as published
+    end
 ~~~
 
 ## 6. Failure-mode analysis
